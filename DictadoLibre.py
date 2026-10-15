@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 APP = "Dictado Libre"
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 REPO = "faculuz/DictadoLibre"
 AUMID = "FacundoLuzardo.DictadoLibre"
 DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "DictadoLibre")
@@ -32,8 +32,10 @@ TYPING_WPM = 40
 BAR_N = 24
 DEFAULT = {
     "modo": "local", "groq_key": "", "pulir": True, "atajo": "ctrl+alt+space",
-    "modo_tecla": "mantener", "estilo": "mantener", "modelo": "small", "idioma": "es",
+    "atajo_cmd": "ctrl+alt+shift+space", "atajo_escribir": "ctrl+alt+a",
+    "modo_tecla": "mantener", "estilo": "mantener", "tono": "auto", "modelo": "small", "idioma": "es",
     "sonidos": True, "inicio_windows": False, "primera_vez": True, "microfono": "",
+    "traducir_en": False, "tonos": {},
 }
 MODELS = [
     ("base", "Rápida"),
@@ -50,10 +52,36 @@ MODEL_HINT = {
 STYLES = [("mantener", "Como lo dije"), ("formal", "Formal"), ("mensaje", "Mensaje de chat")]
 LANGS = [("es", "Español"), ("en", "Inglés"), ("pt", "Portugués")]
 ESTILOS = {
-    "mantener": "",
-    "formal": " Usa un tono formal y profesional.",
-    "mensaje": " Es un mensaje de chat: breve, natural y cercano.",
+    "mantener": "No cambies el tono: solo limpiá el dictado.",
+    "formal": "Tono formal, de correo o documento de trabajo. Tratamiento de usted, frases completas.",
+    "mensaje": "Mensaje de chat: breve, natural, voseo, cercano. Sin saludos largos si no hacen falta.",
+    "tecnico": "Tono técnico, para código o una nota de trabajo. Preciso, sin adornos. Dejá en inglés los términos técnicos.",
 }
+APP_RULES = [
+    ("outlook.exe", "formal", "Correo (Outlook)"),
+    ("olk.exe", "formal", "Correo (Outlook nuevo)"),
+    ("thunderbird.exe", "formal", "Correo (Thunderbird)"),
+    ("winword.exe", "formal", "Word"),
+    ("powerpnt.exe", "formal", "PowerPoint"),
+    ("whatsapp.exe", "mensaje", "WhatsApp"),
+    ("whatsapp.root.exe", "mensaje", "WhatsApp (Store)"),
+    ("slack.exe", "mensaje", "Slack"),
+    ("teams.exe", "mensaje", "Teams"),
+    ("ms-teams.exe", "mensaje", "Teams (nuevo)"),
+    ("telegram.exe", "mensaje", "Telegram"),
+    ("code.exe", "tecnico", "Visual Studio Code"),
+    ("cursor.exe", "tecnico", "Cursor"),
+    ("devenv.exe", "tecnico", "Visual Studio"),
+    ("windowsterminal.exe", "tecnico", "Terminal"),
+    ("notepad++.exe", "tecnico", "Notepad++"),
+]
+DEFAULT_TONOS = {exe: tone for exe, tone, _name in APP_RULES}
+APP_NAMES = {exe: name for exe, _tone, name in APP_RULES}
+TONE_EDIT = [("mantener", "Como lo dije"), ("formal", "Formal"), ("mensaje", "Chat"), ("tecnico", "Técnico")]
+TONE_ALL = [("auto", "Según la aplicación")] + TONE_EDIT
+WEEKDAYS = r"lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo"
+HOUR_WORDS = {"un": 1, "una": 1, "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5, "seis": 6,
+              "siete": 7, "ocho": 8, "nueve": 9, "diez": 10, "once": 11, "doce": 12}
 PRETTY_KEY = {
     "space": "Espacio", "enter": "Enter", "tab": "Tab", "esc": "Esc", "backspace": "Retroceso",
     "up": "Arriba", "down": "Abajo", "left": "Izquierda", "right": "Derecha",
@@ -86,7 +114,14 @@ def load():
         raw = {}
     c = dict(DEFAULT)
     c.update(raw)
-    c["_from_old"] = os.path.exists(CFG) and "microfono" not in raw and not c.get("primera_vez", True)
+    if "tono" not in raw:
+        est = raw.get("estilo", "mantener")
+        c["tono"] = est if est in ("formal", "mensaje", "tecnico") else "auto"
+    if not isinstance(c.get("tonos"), dict):
+        c["tonos"] = {}
+    fresh = not c.get("primera_vez", True) and os.path.exists(CFG)
+    c["_from_old"] = fresh and "microfono" not in raw
+    c["_from_12"] = fresh and "atajo_cmd" not in raw
     return c
 
 cfg = load()
@@ -198,7 +233,10 @@ frames = []
 stream = None
 abort = threading.Event()
 hk = None
+hotkeys = {}
 capturing = False
+session_kind = "dictado"
+session_tone = "mantener"
 mic_lock = threading.RLock()
 level_lock = threading.Lock()
 levels = [0.08] * BAR_N
@@ -269,54 +307,391 @@ def transcribe_groq(audio):
     r.raise_for_status()
     return r.json()["text"].strip()
 
-def polish_groq(text):
-    prompt = (
-        "Eres un editor de dictado. Recibes texto transcrito por voz en español. Corrige puntuación, mayúsculas y ortografía, "
-        "elimina muletillas (eh, este, o sea, mmm), repeticiones y autocorrecciones (si la persona dice 'no, perdón' conserva solo lo corregido). "
-        "Si dicta 'punto y aparte' o 'nueva línea' inserta salto de línea. Respeta palabras en inglés. NO respondas preguntas ni agregues nada: "
-        "devuelve SOLO el texto final." + ESTILOS.get(cfg["estilo"], ""))
+def groq_text(system, user, timeout=45):
+    key = (cfg.get("groq_key") or "").strip()
+    if not key:
+        raise RuntimeError("sin clave")
     r = requests.post(
         "https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": "Bearer " + cfg["groq_key"].strip()},
-        json={"model": "llama-3.3-70b-versatile", "temperature": 0,
-              "messages": [{"role": "system", "content": prompt}, {"role": "user", "content": text}]},
-        timeout=30)
+        headers={"Authorization": "Bearer " + key},
+        json={
+            "model": "openai/gpt-oss-120b",
+            "temperature": 0.3,
+            "reasoning_effort": "low",
+            "include_reasoning": False,
+            "max_completion_tokens": 8192,
+            "messages": [{"role": "system", "content": system}, {"role": "user", "content": user[:12000]}],
+        },
+        timeout=timeout)
     r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"].strip()
+    choice = (r.json().get("choices") or [{}])[0]
+    msg = choice.get("message") or {}
+    out = (msg.get("content") or "").strip()
+    if choice.get("finish_reason") == "length" and not out:
+        raise RuntimeError("respuesta vacía")
+    parts = re.split(r"(?is)<\|channel\|>final<\|message\|>", out)
+    if len(parts) > 1:
+        out = parts[-1]
+    out = re.sub(r"<\|[^|>]*\|>", "", out).strip()
+    out = re.sub(r"^```(?:\w+)?\s*", "", out)
+    out = re.sub(r"\s*```$", "", out)
+    out = re.sub(r"(?i)^(texto final|resultado|mensaje)\s*:\s*", "", out).strip()
+    if len(out) >= 2 and out[0] == out[-1] and out[0] in "\"'":
+        out = out[1:-1].strip()
+    if not out:
+        raise RuntimeError("respuesta vacía")
+    return out
+
+def remove_fillers(t):
+    t = re.sub(r"(?i)^(?:bueno|este|eh+|em+|ehm+)\s*,\s*", "", t or "")
+    t = re.sub(r"(?i)\b(eh+|em+|ehm+|mm+|mmm+|este\.\.\.|o sea|osea|digamos)\b[,.]?\s*", "", t)
+    t = re.sub(r"(?i)\btipo\b(?=\s*[,.])\s*", "", t)
+    return t
+
+def resolve_corrections(t):
+    patterns = [
+        r"(?is)^.*(?:\.{2,}|…)\s*no\b[, ]+(?:mejor\s+|perdón\s+|perdis\s+|digo\s+|quise decir\s+)?(.+)$",
+        r"(?is)^.*\bno\b[, ]+(?:mejor|perdón|perdis|digo|quise decir)\s+(.+)$",
+    ]
+    cur = (t or "").strip()
+    for _ in range(3):
+        nxt = None
+        for p in patterns:
+            m = re.match(p, cur)
+            if m:
+                nxt = m.group(1).strip(" .,")
+                break
+        if not nxt or nxt == cur:
+            break
+        cur = nxt
+    return cur
+
+def normalize_times(t):
+    def repl(m):
+        raw_h = m.group(1).lower()
+        hour = int(raw_h) if raw_h.isdigit() else HOUR_WORDS.get(raw_h)
+        if not hour or hour > 12:
+            return m.group(0)
+        extra = (m.group(2) or "").lower()
+        daypart = (m.group(3) or "").lower()
+        if "mañana" in daypart or daypart.strip() == "am":
+            hh = 0 if hour == 12 else hour
+        elif "tarde" in daypart or "noche" in daypart or daypart.strip() == "pm":
+            hh = hour if hour >= 12 else hour + 12
+        elif hour <= 7 and re.search(r"(?i)\b(" + WEEKDAYS + r")\b", t):
+            hh = hour + 12
+        else:
+            hh = hour
+        if "menos" in extra:
+            hh = (hh - 1) % 24
+            mm = 45
+        elif "media" in extra:
+            mm = 30
+        elif "cuarto" in extra:
+            mm = 15
+        else:
+            mm = 0
+        changed = hh != hour or mm or daypart or extra
+        if not changed:
+            return m.group(0)
+        return f"a las {hh}:{mm:02d}"
+    return re.sub(
+        r"(?i)\ba\s+las\s+(\d{1,2}|un|una|dos|tres|cuatro|cinco|seis|siete|ocho|nueve|diez|once|doce)"
+        r"(?:\s+((?:y\s+(?:media|cuarto))|(?:menos\s+cuarto)))?"
+        r"(?:\s+((?:de\s+la\s+(?:mañana|tarde|noche))|(?:am|pm)))?",
+        repl, t or "")
+
+def format_structure(t):
+    t = re.sub(r"\s*(?:punto y aparte|nuevo p[aá]rrafo)\s*[.,]?\s*", ".\n\n", t or "", flags=re.I)
+    t = re.sub(r"\s*(?:nueva l[ií]nea|salto de l[ií]nea)\s*[.,]?\s*", "\n", t, flags=re.I)
+    t = t.replace("..\n", ".\n")
+    if re.search(r"(?i)\bviñetas?\b", t):
+        raw_parts = re.split(r"(?i)\s*viñetas?\s*[:,.]?\s*", t)
+        started = not raw_parts[0].strip(" .,")
+        parts = [p.strip(" .,") for p in raw_parts if p.strip(" .,")]
+        if parts and re.fullmatch(r"(?i)(?:una\s+)?lista|hac[eé]\s+una\s+lista|quiero\s+una\s+lista", parts[0]):
+            parts = parts[1:]
+            started = True
+        if parts and (started or len(parts) >= 2):
+            head, items = ("", parts) if started else (parts[0], parts[1:])
+            if re.fullmatch(r"(?i)(?:una\s+)?lista|hac[eé]\s+una\s+lista|quiero\s+una\s+lista", head or ""):
+                head = ""
+            if items:
+                body = "\n".join(f"- {x[:1].upper() + x[1:]}" for x in items)
+                return (head + "\n" + body).strip() if head else body
+    if len(re.findall(r"(?i)\b(primero|segundo|tercero|cuarto|quinto|sexto)\b", t)) >= 2:
+        parts = re.split(r"(?i)\s*(?:primero|segundo|tercero|cuarto|quinto|sexto)\s*[:,.]?\s*", t)
+        items = []
+        for p in parts:
+            p = re.sub(r"(?i)\s+y$", "", p.strip(" .,")).strip()
+            if p:
+                items.append(p)
+        if len(items) >= 2:
+            intro, rows = "", items
+            if not re.match(r"(?i)^(?:primero)\b", t.strip()) and len(items) >= 3:
+                intro, rows = items[0], items[1:]
+            body = "\n".join(f"{i}. {x[:1].upper() + x[1:]}" for i, x in enumerate(rows, 1))
+            return (intro + "\n" + body).strip() if intro else body
+    return t
+
+def capitalize_blocks(t):
+    out = []
+    for block in re.split(r"(\n+)", t or ""):
+        if not block or block.startswith("\n"):
+            out.append(block)
+            continue
+        m = re.match(r"^(\s*(?:-\s+|\d+\.\s+)?)(.*)$", block, re.S)
+        prefix, body = (m.group(1), m.group(2)) if m else ("", block)
+        body = body.strip()
+        if body:
+            body = body[:1].upper() + body[1:]
+            if not re.match(r"^(?:-\s+|\d+\.\s+)", prefix or "") and body[-1] not in ".!?…:":
+                body += "."
+        out.append((prefix or "") + body)
+    return "".join(out).strip()
+
+def polish_text_local(t, tone="mantener"):
+    t = remove_fillers(t)
+    t = resolve_corrections(t)
+    t = normalize_times(t)
+    t = format_structure(t)
+    t = re.sub(r"(?i)\b(\w+)( \1\b)+", r"\1", t)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    t = re.sub(r" *\n *", "\n", t).strip()
+    t = re.sub(r"\s+([,.;:!?])", r"\1", t)
+    t = capitalize_blocks(t)
+    if tone == "tecnico":
+        t = re.sub(r"(?m)^(-\s+|\d+\.\s+)?", r"\1", t)
+    return t
 
 def polish_local(t):
-    t = re.sub(r"\b(eh+|em+|mm+|este\.\.\.|ehm)\b[,.]?\s*", "", t, flags=re.I)
-    t = re.sub(r"\s*(punto y aparte|nueva l[ií]nea)\s*[.,]?\s*", ".\n", t, flags=re.I)
-    t = re.sub(r"\b(\w+)( \1\b)+", r"\1", t, flags=re.I)
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    return t[:1].upper() + t[1:] if t else t
+    return polish_text_local(t, "mantener")
+
+def command_local(selected, instruction):
+    ins = (instruction or "").lower()
+    if re.search(r"ingl[eé]s|traduc", ins):
+        return None
+    if re.search(r"may[uú]scul", ins):
+        return selected.upper()
+    if re.search(r"min[uú]scul", ins):
+        return selected.lower()
+    lines = [ln.strip() for ln in re.split(r"[\n;]+|(?<=\.)\s+", selected) if ln.strip()]
+    if re.search(r"viñet|lista|bullet", ins):
+        return "\n".join(f"- {ln.rstrip('.')}" for ln in lines) if lines else selected
+    if re.search(r"numer", ins):
+        return "\n".join(f"{i}. {ln.rstrip('.')}" for i, ln in enumerate(lines, 1)) if lines else selected
+    if re.search(r"p[aá]rrafo", ins):
+        return "\n\n".join(ln.rstrip(".") + "." for ln in lines) if lines else selected
+    return polish_text_local(selected, "mantener")
+
+def help_local(instruction, tone):
+    t = remove_fillers(instruction or "")
+    t = resolve_corrections(t)
+    t = normalize_times(t)
+    t = re.sub(r"\s{2,}", " ", t).strip(" .")
+    name, body = None, ""
+    m = re.search(r"(?i)(?:escribile|decile|mandale|avisale)\s+a\s+([A-Za-zÁÉÍÓÚáéíóúñÑ]+)\s+que\s+(.+)", t)
+    if m:
+        name, body = m.group(1), m.group(2)
+        name = name[:1].upper() + name[1:]
+    else:
+        m2 = re.search(r"(?i)^(?:escrib[ií]|redact[aá]|arm[aá]|hac[eé])(?:me|le)?(?:\s+un)?(?:\s+(?:mensaje|mail|correo|texto))?(?:\s+para\s+[A-Za-zÁÉÍÓÚáéíóúñÑ]+)?\s*(?:que\s+|sobre\s+|de\s+que\s+)?(.+)", t)
+        body = m2.group(1) if m2 else t
+    body = body.strip(" .")
+    if not body:
+        return ""
+    sentence = body[:1].upper() + body[1:]
+    if sentence[-1] not in ".!?":
+        sentence += "."
+    low = sentence[:1].lower() + sentence[1:]
+    if tone == "formal":
+        who = f" {name}" if name else ""
+        return f"Hola{who},\n\nTe escribo para contarte que {low}"
+    if tone == "tecnico":
+        return sentence
+    if name:
+        return f"Hola {name}, {low}"
+    return sentence
+
+def tone_for_name(proc):
+    choice = cfg.get("tono") or "auto"
+    if choice != "auto":
+        return choice
+    name = (proc or "").lower()
+    custom = cfg.get("tonos") if isinstance(cfg.get("tonos"), dict) else {}
+    merged = dict(DEFAULT_TONOS)
+    merged.update({str(k).lower(): v for k, v in custom.items()})
+    return merged.get(name, "mantener")
+
+def active_process_name():
+    if os.name != "nt":
+        return ""
+    try:
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        hwnd = user32.GetForegroundWindow()
+        pid = ctypes.c_ulong()
+        user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        handle = kernel32.OpenProcess(0x1000, False, pid.value)
+        if not handle:
+            return ""
+        buf = ctypes.create_unicode_buffer(1024)
+        size = ctypes.c_ulong(1024)
+        ok = kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size))
+        kernel32.CloseHandle(handle)
+        return os.path.basename(buf.value) if ok else ""
+    except Exception as e:
+        log("proceso", repr(e))
+        return ""
+
+def tone_now():
+    return tone_for_name(active_process_name())
+
+def _english_line(on):
+    return " El texto final tiene que estar en inglés natural, listo para pegar." if on else " El texto final queda en español."
+
+def prompt_dictado(tone):
+    return (
+        "Sos un editor de dictado en español rioplatense. Recibís texto transcrito por voz, no una pregunta.\n"
+        "Reglas:\n"
+        "- Quitá muletillas (eh, este, o sea, mmm, digamos) y repeticiones.\n"
+        "- Si la persona se corrige, dejá solo la versión final. Ejemplo: "
+        "'martes... no, mejor jueves a las 4' se escribe 'jueves a las 16:00'. "
+        "Las horas de una cita (a las 1 a a las 7), si no dice 'de la mañana', van en 24 horas.\n"
+        "- Si pide párrafos ('punto y aparte', 'nuevo párrafo') o una lista ('viñeta', 'primero, segundo'), "
+        "formateá con saltos de línea, '- ' o '1. '.\n"
+        "- No inventes datos, no respondas preguntas y no agregues explicaciones. Devolvé solo el texto final.\n"
+        "- " + ESTILOS.get(tone, ESTILOS["mantener"]) + _english_line(cfg.get("traducir_en")))
+
+def prompt_command(tone):
+    return (
+        "Tenés un texto que la persona seleccionó y una instrucción dicha en voz alta. "
+        "Aplicá la instrucción a ese texto y devolvé solo el resultado, sin comillas ni explicación. "
+        "Podés corregir, resumir, cambiar el tono, traducir, pasar a viñetas o reescribir. "
+        "No inventes datos que no estén en el texto o en la instrucción.\n"
+        "- " + ESTILOS.get(tone, ESTILOS["mantener"]) + _english_line(cfg.get("traducir_en")))
+
+def prompt_escribir(tone):
+    return (
+        "La persona dictó una instrucción corta para redactar un mensaje. Escribí el mensaje completo, listo para enviar. "
+        "No expliques lo que hiciste. No inventes nombres, fechas, lugares ni números que no estén en la instrucción.\n"
+        "- " + ESTILOS.get(tone, ESTILOS["mantener"]) + _english_line(cfg.get("traducir_en")))
+
+def shape_text(raw, kind, selected, tone):
+    english = bool(cfg.get("traducir_en"))
+    has_key = bool((cfg.get("groq_key") or "").strip())
+    if kind == "dictado" and not cfg.get("pulir", True):
+        text = (raw or "").strip()
+        if english and has_key:
+            try:
+                return groq_text("Traducí el texto al inglés natural. Devolvé solo la traducción, sin comillas.", text) or text
+            except Exception as e:
+                log("traduccion", e)
+                notify("Groq no respondió. Dejé el texto en español.")
+        elif english:
+            notify("Para escribir en inglés hace falta la clave gratis de Groq. Dejé el texto en español.")
+        return text
+    elif has_key:
+        try:
+            if kind == "comando":
+                user = f"Texto seleccionado:\n{selected}\n\nInstrucción de voz:\n{raw}"
+                text = groq_text(prompt_command(tone), user)
+            elif kind == "escribir":
+                text = groq_text(prompt_escribir(tone), raw)
+            else:
+                text = groq_text(prompt_dictado(tone), raw)
+            if text:
+                return text
+        except Exception as e:
+            log("llm", repr(e))
+            if english or kind != "dictado":
+                notify("Groq no respondió. Sigo con lo que puedo hacer en esta computadora.")
+    elif english and kind == "dictado":
+        notify("Para escribir en inglés hace falta la clave gratis de Groq. Dejé el texto en español.")
+    if kind == "comando":
+        text = command_local(selected, raw)
+        if text is None:
+            notify("Traducir el texto necesita la clave de Groq. No lo cambié.")
+            return ""
+        if english and not has_key:
+            notify("Para dejarlo en inglés hace falta la clave de Groq. Apliqué el cambio en español.")
+        return text
+    if kind == "escribir":
+        if english and not has_key:
+            notify("Para escribir en inglés hace falta la clave de Groq. Armé el mensaje en español.")
+        return help_local(raw, tone)
+    return polish_text_local(raw, tone)
+
+def grab_selection():
+    with paste_lock:
+        try:
+            old = pyperclip.paste()
+        except Exception:
+            old = ""
+        try:
+            pyperclip.copy("")
+        except Exception:
+            return ""
+        for _ in range(30):
+            try:
+                if not any(keyboard.is_pressed(k) for k in ("ctrl", "alt", "shift", "windows")):
+                    break
+            except Exception:
+                break
+            time.sleep(0.04)
+        try:
+            keyboard.send("ctrl+c")
+        except Exception as e:
+            log("seleccion", repr(e))
+            try:
+                pyperclip.copy(old or "")
+            except Exception:
+                pass
+            return ""
+        time.sleep(0.18)
+        try:
+            selected = pyperclip.paste() or ""
+        except Exception:
+            selected = ""
+        try:
+            pyperclip.copy(old or "")
+        except Exception:
+            pass
+        return selected.strip()
 
 def process(audio):
+    kind = session_kind
+    tone = session_tone or "mantener"
     try:
         if abort.is_set():
             return
         if len(audio) < FS * 0.3:
             set_state("listo", "corto")
             return
-        set_state("procesando", "")
-        text = ""
-        online = cfg["modo"] == "online" and cfg["groq_key"].strip()
+        proc_tip = kind if kind in ("comando", "escribir") else (tone if tone != "mantener" else "")
+        set_state("procesando", proc_tip)
+        selected = ""
+        if kind == "comando":
+            selected = grab_selection()
+            if not selected:
+                notify("Primero seleccioná el texto. Después usá el atajo de comando y decí qué hacer.")
+                set_state("listo", "vacio")
+                return
+        online = cfg.get("modo") == "online" and (cfg.get("groq_key") or "").strip()
         if online:
             try:
-                text = transcribe_groq(audio)
-                if cfg["pulir"] and text:
-                    try:
-                        text = polish_groq(text)
-                    except Exception as e:
-                        log("pulido falló", e)
-                        text = polish_local(text)
+                raw = transcribe_groq(audio)
             except Exception as e:
                 log("Groq falló, uso local:", e)
-                text = polish_local(transcribe_local(audio))
+                raw = transcribe_local(audio)
         else:
-            text = transcribe_local(audio)
-            if cfg["pulir"]:
-                text = polish_local(text)
+            raw = transcribe_local(audio)
+        if abort.is_set():
+            return
+        if not (raw or "").strip():
+            set_state("listo", "vacio")
+            return
+        text = shape_text(raw.strip(), kind, selected, tone)
         if abort.is_set():
             return
         if text:
@@ -430,7 +805,7 @@ def start_rec():
         frames = []
         recording = True
         beep("start")
-        set_state("grabando", "")
+        set_state("grabando", {"comando": "comando", "escribir": "escribir"}.get(session_kind, ""))
         dev = resolve_device(cfg.get("microfono") or "")
         try:
             try:
@@ -482,18 +857,45 @@ def cancel_dictation():
     elif state_name == "procesando":
         set_state("listo", "cancelado")
 
-def on_hotkey():
-    if capturing:
+def _combo_held(combo):
+    combo = (combo or "").strip().lower()
+    if not combo:
+        return False
+    try:
+        return bool(keyboard.is_pressed(combo))
+    except Exception:
+        return False
+
+def _most_specific_kind():
+    best = None
+    for kind, key in (("dictado", "atajo"), ("comando", "atajo_cmd"), ("escribir", "atajo_escribir")):
+        combo = (cfg.get(key) or "").strip().lower()
+        if combo and _combo_held(combo):
+            score = len(combo.split("+"))
+            if best is None or score > best[0]:
+                best = (score, kind)
+    return best[1] if best else None
+
+def on_hotkey(kind="dictado"):
+    global session_kind, session_tone
+    if capturing or state_name == "procesando":
         return
-    if cfg.get("modo_tecla") == "alternar":
-        stop_rec() if recording else start_rec()
+    specific = _most_specific_kind()
+    if specific and specific != kind:
         return
     if recording:
+        if cfg.get("modo_tecla") == "alternar" and session_kind == kind:
+            stop_rec()
         return
+    session_kind = kind
+    session_tone = tone_now()
     start_rec()
+    if cfg.get("modo_tecla") == "alternar":
+        return
+    keyname = {"dictado": "atajo", "comando": "atajo_cmd", "escribir": "atajo_escribir"}.get(kind, "atajo")
+    key = (cfg.get(keyname) or "").strip().lower()
 
     def waiter():
-        key = cfg.get("atajo") or ""
         last = key.split("+")[-1] if key else ""
         while True:
             try:
@@ -508,36 +910,48 @@ def on_hotkey():
     threading.Thread(target=waiter, daemon=True).start()
 
 def register_hotkey(announce=True):
-    global hk
+    global hk, hotkeys
+    for h in list(hotkeys.values()):
+        try:
+            keyboard.remove_hotkey(h)
+        except Exception:
+            pass
     try:
         if hk:
             keyboard.remove_hotkey(hk)
     except Exception:
         pass
     hk = None
-    atajo = (cfg.get("atajo") or "").strip().lower()
-
-    def bind(combo):
-        return keyboard.add_hotkey(combo, on_hotkey, suppress=False, trigger_on_release=False)
-
-    try:
-        hk = bind(atajo)
-        return True
-    except Exception as e:
-        log("atajo", repr(e))
-        if atajo != "ctrl+alt+space":
-            cfg["atajo"] = "ctrl+alt+space"
-            save()
-            try:
-                hk = bind(cfg["atajo"])
-                if announce:
-                    notify("Ese atajo no funciona. Volví a Ctrl + Alt + Espacio.")
-                return True
-            except Exception as e2:
-                log("atajo fallback", repr(e2))
-        if announce:
-            notify("No pude activar el atajo. Abrí Configuración y elegí otro.")
-        return False
+    hotkeys = {}
+    specs = [
+        ("atajo", "ctrl+alt+space", "dictado"),
+        ("atajo_cmd", "ctrl+alt+shift+space", "comando"),
+        ("atajo_escribir", "ctrl+alt+a", "escribir"),
+    ]
+    changed = False
+    for key, fallback, kind in specs:
+        combo = (cfg.get(key) or fallback).strip().lower()
+        try:
+            hotkeys[key] = keyboard.add_hotkey(combo, lambda k=kind: on_hotkey(k), suppress=False, trigger_on_release=False)
+        except Exception as e:
+            log("atajo", key, repr(e))
+            if combo != fallback:
+                cfg[key] = fallback
+                changed = True
+                try:
+                    hotkeys[key] = keyboard.add_hotkey(fallback, lambda k=kind: on_hotkey(k), suppress=False, trigger_on_release=False)
+                    if announce:
+                        notify(f"Un atajo no funcionaba. Volví a {pretty_hotkey(fallback)}.")
+                except Exception as e2:
+                    log("atajo fallback", key, repr(e2))
+    if "atajo" in hotkeys:
+        hk = hotkeys["atajo"]
+    if changed:
+        save()
+    ok = "atajo" in hotkeys
+    if not ok and announce:
+        notify("No pude activar el atajo. Abrí Configuración y elegí otro.")
+    return ok
 
 # ---------- actualizaciones automáticas ----------
 def vtuple(v):
@@ -799,10 +1213,23 @@ class Pill(QWidget):
         if self.tip == "actualizando":
             return "Actualizando", "Se instala sola"
         if self.state == "grabando":
-            if cfg.get("modo_tecla") == "alternar":
-                return "Escuchando", "Tocá de nuevo"
-            return "Escuchando", "Soltá para pegar"
+            hold = cfg.get("modo_tecla") != "alternar"
+            if self.tip == "comando":
+                return "Comando", "Soltá para aplicar" if hold else "Tocá para aplicar"
+            if self.tip == "escribir":
+                return "Ayuda", "Soltá para armar" if hold else "Tocá para armar"
+            return "Escuchando", "Soltá para pegar" if hold else "Tocá de nuevo"
         if self.state == "procesando":
+            if self.tip == "comando":
+                return "Aplicando", "Un segundo"
+            if self.tip == "escribir":
+                return "Armando", "Un segundo"
+            if self.tip == "formal":
+                return "Procesando", "Tono formal"
+            if self.tip == "mensaje":
+                return "Procesando", "Tono chat"
+            if self.tip == "tecnico":
+                return "Procesando", "Tono técnico"
             return "Procesando", "Un segundo"
         if self.state == "cargando":
             return "Preparando", "Solo la primera vez"
@@ -1059,8 +1486,11 @@ class Settings(QWidget):
         self.setMinimumSize(880, 620)
         self.resize(980, 680)
         self.hotkey = cfg.get("atajo") or "ctrl+alt+space"
+        self.hotkey_cmd = cfg.get("atajo_cmd") or "ctrl+alt+shift+space"
+        self.hotkey_write = cfg.get("atajo_escribir") or "ctrl+alt+a"
         self.modo = cfg.get("modo") or "local"
         self.tecla = cfg.get("modo_tecla") or "mantener"
+        self._cap_target = "atajo"
         self._capturing = False
         ico = resource("icon.ico")
         if os.path.exists(ico):
@@ -1078,6 +1508,7 @@ class Settings(QWidget):
         self.stack.addWidget(scroller(self._page_general()))
         self.stack.addWidget(scroller(self._page_voz()))
         self.stack.addWidget(scroller(self._page_mic()))
+        self.stack.addWidget(scroller(self._page_write()))
         self.stack.addWidget(scroller(self._page_hist()))
         self.stack.addWidget(scroller(self._page_stats()))
         right.addWidget(self.stack, 1)
@@ -1115,7 +1546,7 @@ class Settings(QWidget):
         lay.addWidget(ver)
         lay.addSpacing(18)
         self.nav = []
-        for i, text in enumerate(("General", "Voz", "Micrófono", "Historial", "Métricas")):
+        for i, text in enumerate(("General", "Voz", "Micrófono", "Escritura", "Historial", "Métricas")):
             b = button(text, "nav")
             b.setCheckable(True)
             b.clicked.connect(lambda _=False, n=i: self.open_page(n))
@@ -1135,7 +1566,7 @@ class Settings(QWidget):
         bar.setAttribute(Qt.WA_StyledBackground, True)
         h = QHBoxLayout(bar)
         h.setContentsMargins(28, 12, 28, 12)
-        self.footer_msg = muted("El atajo, la voz y el micrófono se aplican al guardar.")
+        self.footer_msg = muted("Los cambios se aplican al guardar.")
         h.addWidget(self.footer_msg, 1)
         self.save_btn = button("Guardar", "primary")
         self.save_btn.setFixedWidth(140)
@@ -1165,12 +1596,12 @@ class Settings(QWidget):
         k.setObjectName("muted")
         self.hk_label = QLabel(pretty_hotkey(self.hotkey))
         self.hk_label.setObjectName("hotkey")
-        self.hk_btn = button("Cambiar atajo", "ghost")
-        self.hk_btn.clicked.connect(self._begin_capture)
+        self.hk_btn = button("Cambiar", "ghost")
+        self.hk_btn.clicked.connect(lambda: self._begin_capture("atajo"))
         bl.addWidget(k)
         bl.addWidget(self.hk_label)
         bl.addWidget(self.hk_btn, 0, Qt.AlignLeft)
-        bl.addWidget(muted("Apretá Cambiar atajo y después la combinación. Por ejemplo, Ctrl + Alt + Espacio."))
+        bl.addWidget(muted("Apretá Cambiar y después la combinación. Por ejemplo, Ctrl + Alt + Espacio."))
         lay.addWidget(box)
         row = QHBoxLayout()
         row.setSpacing(12)
@@ -1222,7 +1653,7 @@ class Settings(QWidget):
         tools.addStretch(1)
         tools.addLayout(show_row)
         bl.addLayout(tools)
-        bl.addWidget(muted("Groq te da una clave gratis. Sin ella, el dictado sigue funcionando en esta computadora."))
+        bl.addWidget(muted("Groq es gratis. La clave también acomoda el texto, el comando y Ayudame a escribir, aunque dictes en esta computadora. Sin clave, eso se hace acá, más simple."))
         lay.addWidget(box)
         box2 = card()
         b2 = QVBoxLayout(box2)
@@ -1258,20 +1689,140 @@ class Settings(QWidget):
         col = QVBoxLayout()
         col.setSpacing(2)
         col.addWidget(QLabel("Pulir el texto"))
-        col.addWidget(muted("Saca muletillas, acomoda puntos y mayúsculas. No cambia lo que quisiste decir."))
+        col.addWidget(muted("Saca muletillas, resuelve cuando te corregís y arma párrafos o listas. El tono se elige en Escritura."))
         self.sw_pulir = Switch(cfg.get("pulir", True))
         top.addLayout(col, 1)
         top.addWidget(self.sw_pulir, 0, Qt.AlignVCenter)
         b3.addLayout(top)
-        b3.addWidget(QLabel("Estilo, cuando pulís por internet"))
-        self.style = QComboBox()
-        polish_combo(self.style)
-        fill_combo(self.style, STYLES, cfg.get("estilo") or "mantener")
-        b3.addWidget(self.style)
-        b3.addWidget(muted("Formal queda más profesional. Mensaje de chat, más corto y cercano."))
         lay.addWidget(box3)
         lay.addStretch(1)
         return page
+
+    def _page_write(self):
+        page, lay = self._page_shell(
+            "Escritura",
+            "El texto puede cambiar de tono según el programa de adelante. También podés transformar una selección o dictar la idea de un mensaje.")
+        box = card()
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(18, 14, 18, 14)
+        bl.setSpacing(8)
+        bl.addWidget(QLabel("Tono"))
+        self.tone_combo = QComboBox()
+        polish_combo(self.tone_combo)
+        fill_combo(self.tone_combo, TONE_ALL, cfg.get("tono") or "auto")
+        bl.addWidget(self.tone_combo)
+        bl.addWidget(muted("Según la aplicación usa formal en el correo y en Word, chat en WhatsApp o Slack, y técnico en el código. Si elegís uno fijo, se usa siempre."))
+        lay.addWidget(box)
+        self.sw_en = Switch(bool(cfg.get("traducir_en")))
+        lay.addWidget(switch_row(
+            "Escribir en inglés",
+            "El texto sale en inglés. Sin la clave de Groq, queda en español y te aviso.",
+            self.sw_en))
+        lay.addWidget(self._hotkey_card(
+            "Comando",
+            "Seleccioná un texto, mantené este atajo y decí qué hacer. Por ejemplo: hacelo más formal, o pasalo a viñetas.",
+            "cmd", "hotkey_cmd"))
+        lay.addWidget(self._hotkey_card(
+            "Ayudame a escribir",
+            "Dictá la idea y se arma el mensaje. Por ejemplo: escribile a Juan que llego tarde el jueves.",
+            "escribir", "hotkey_write"))
+        apps = card()
+        al = QVBoxLayout(apps)
+        al.setContentsMargins(18, 14, 18, 14)
+        al.setSpacing(8)
+        al.addWidget(QLabel("Tono de cada programa"))
+        al.addWidget(muted("Podés cambiarlo. Chrome es un solo programa para todas las pestañas, así que Gmail en el navegador no se distingue del resto."))
+        self.tone_box = QVBoxLayout()
+        self.tone_box.setSpacing(8)
+        al.addLayout(self.tone_box)
+        self._tone_widgets = []
+        saved = {str(k).lower(): v for k, v in (cfg.get("tonos") or {}).items()} if isinstance(cfg.get("tonos"), dict) else {}
+        for exe, tone, _name in APP_RULES:
+            self._add_tone_row(exe, saved.get(exe, tone), removable=False)
+        for exe, tone in saved.items():
+            if exe not in DEFAULT_TONOS:
+                self._add_tone_row(exe, tone, removable=True)
+        add = QHBoxLayout()
+        self.exe_edit = QLineEdit()
+        self.exe_edit.setPlaceholderText("Otro programa, por ejemplo chrome.exe")
+        self.exe_tone = QComboBox()
+        polish_combo(self.exe_tone)
+        fill_combo(self.exe_tone, TONE_EDIT, "formal")
+        add_btn = button("Agregar", "ghost")
+        add_btn.clicked.connect(self._add_custom_tone)
+        add.addWidget(self.exe_edit, 1)
+        add.addWidget(self.exe_tone)
+        add.addWidget(add_btn)
+        al.addLayout(add)
+        lay.addWidget(apps)
+        lay.addStretch(1)
+        return page
+
+    def _hotkey_card(self, title, subtitle, target, attr):
+        box = card()
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(18, 14, 18, 14)
+        bl.setSpacing(6)
+        bl.addWidget(QLabel(title))
+        lab = QLabel(pretty_hotkey(getattr(self, attr)))
+        lab.setObjectName("hotkey")
+        btn = button("Cambiar", "ghost")
+        btn.clicked.connect(lambda _=False, t=target: self._begin_capture(t))
+        bl.addWidget(lab)
+        bl.addWidget(btn, 0, Qt.AlignLeft)
+        bl.addWidget(muted(subtitle))
+        if target == "cmd":
+            self.hk_cmd_label, self.hk_cmd_btn = lab, btn
+        else:
+            self.hk_write_label, self.hk_write_btn = lab, btn
+        return box
+
+    def _add_tone_row(self, exe, tone, removable):
+        exe = (exe or "").strip().lower()
+        if not exe:
+            return
+        for item in self._tone_widgets:
+            if item["exe"] == exe:
+                i = item["combo"].findData(tone)
+                if i >= 0:
+                    item["combo"].setCurrentIndex(i)
+                return
+        row = card()
+        h = QHBoxLayout(row)
+        h.setContentsMargins(12, 8, 12, 8)
+        lab = QLabel(APP_NAMES.get(exe, exe))
+        lab.setWordWrap(True)
+        combo = QComboBox()
+        polish_combo(combo)
+        fill_combo(combo, TONE_EDIT, tone if tone in dict(TONE_EDIT) else "mantener")
+        combo.setMinimumWidth(150)
+        h.addWidget(lab, 1)
+        h.addWidget(combo)
+        if removable:
+            rm = button("Quitar", "danger")
+            rm.clicked.connect(lambda _=False, e=exe: self._remove_tone(e))
+            h.addWidget(rm)
+        self.tone_box.addWidget(row)
+        self._tone_widgets.append({"exe": exe, "combo": combo, "row": row})
+
+    def _remove_tone(self, exe):
+        keep = []
+        for item in self._tone_widgets:
+            if item["exe"] == exe:
+                self.tone_box.removeWidget(item["row"])
+                item["row"].deleteLater()
+            else:
+                keep.append(item)
+        self._tone_widgets = keep
+
+    def _add_custom_tone(self):
+        name = self.exe_edit.text().strip().lower()
+        if not name:
+            return
+        if not name.endswith(".exe"):
+            name += ".exe"
+        self._add_tone_row(name, self.exe_tone.currentData() or "formal", removable=True)
+        self.exe_edit.clear()
 
     def _page_mic(self):
         page, lay = self._page_shell("Micrófono", "Elegí con cuál querés dictar. La barra se mueve si te escucha.")
@@ -1382,7 +1933,7 @@ class Settings(QWidget):
     def _select_nav(self, index):
         for i, b in enumerate(self.nav):
             b.setChecked(i == index)
-        editing = index in (0, 1, 2)
+        editing = index in (0, 1, 2, 3)
         self.save_btn.setVisible(editing)
         self.footer_msg.setVisible(editing)
         self.footer.setVisible(editing)
@@ -1396,9 +1947,9 @@ class Settings(QWidget):
 
     def _on_page(self, index):
         self._select_nav(index)
-        if index == 3:
+        if index == 4:
             self._refresh_history()
-        elif index == 4:
+        elif index == 5:
             self._refresh_stats()
         if controller is not None:
             if index == 2 and self.isVisible():
@@ -1429,13 +1980,27 @@ class Settings(QWidget):
         else:
             threading.Thread(target=check_update, args=(True,), daemon=True).start()
 
-    def _begin_capture(self):
+    def _begin_capture(self, target="atajo"):
         global capturing
         capturing = True
         self._capturing = True
-        self.hk_btn.setText("Apretá la combinación…  Esc cancela")
-        self.hk_label.setText("Esperando teclas")
+        self._cap_target = target
+        btn, lab = self._hotkey_widgets(target)
+        btn.setText("Apretá la combinación…  Esc cancela")
+        lab.setText("Esperando teclas")
         self.grabKeyboard()
+
+    def _hotkey_widgets(self, target):
+        if target == "cmd":
+            return self.hk_cmd_btn, self.hk_cmd_label
+        if target == "escribir":
+            return self.hk_write_btn, self.hk_write_label
+        return self.hk_btn, self.hk_label
+
+    def _sync_hotkey_labels(self):
+        self.hk_label.setText(pretty_hotkey(self.hotkey))
+        self.hk_cmd_label.setText(pretty_hotkey(self.hotkey_cmd))
+        self.hk_write_label.setText(pretty_hotkey(self.hotkey_write))
 
     def _end_capture(self):
         global capturing
@@ -1444,8 +2009,9 @@ class Settings(QWidget):
         capturing = False
         self._capturing = False
         self.releaseKeyboard()
-        self.hk_btn.setText("Cambiar atajo")
-        self.hk_label.setText(pretty_hotkey(self.hotkey))
+        btn, _lab = self._hotkey_widgets(self._cap_target)
+        btn.setText("Cambiar")
+        self._sync_hotkey_labels()
 
     def keyPressEvent(self, e):
         if not self._capturing:
@@ -1469,7 +2035,13 @@ class Settings(QWidget):
             mods.append("shift")
         if m & Qt.MetaModifier:
             mods.append("windows")
-        self.hotkey = "+".join(mods + [name])
+        combo = "+".join(mods + [name])
+        if self._cap_target == "cmd":
+            self.hotkey_cmd = combo
+        elif self._cap_target == "escribir":
+            self.hotkey_write = combo
+        else:
+            self.hotkey = combo
         self._end_capture()
 
     def _save(self):
@@ -1482,23 +2054,42 @@ class Settings(QWidget):
             modo = "local"
             self._set_modo("local")
         old_model = cfg.get("modelo")
+        atajo = (self.hotkey or "ctrl+alt+space").strip().lower()
+        atajo_cmd = (self.hotkey_cmd or "ctrl+alt+shift+space").strip().lower()
+        atajo_escribir = (self.hotkey_write or "ctrl+alt+a").strip().lower()
+        if len({atajo, atajo_cmd, atajo_escribir}) < 3:
+            self._alert("Atajos", "El dictado, el comando y Ayudame a escribir tienen que usar combinaciones distintas.")
+            return
+        tono = self.tone_combo.currentData() or "auto"
+        tonos = {}
+        for item in self._tone_widgets:
+            try:
+                tonos[item["exe"]] = item["combo"].currentData() or "mantener"
+            except RuntimeError:
+                pass
         cfg.update(
             modo=modo, groq_key=key, pulir=self.sw_pulir.isChecked(),
-            atajo=(self.hotkey or "ctrl+alt+space").strip().lower(),
+            atajo=atajo, atajo_cmd=atajo_cmd, atajo_escribir=atajo_escribir,
             modo_tecla=self.tecla, modelo=self.model.currentData() or "small",
-            estilo=self.style.currentData() or "mantener", idioma=self.lang.currentData() or "es",
+            tono=tono, estilo=tono if tono != "auto" else cfg.get("estilo", "mantener"),
+            idioma=self.lang.currentData() or "es",
             sonidos=self.sw_son.isChecked(), inicio_windows=self.sw_ini.isChecked(),
-            microfono=self.mic.currentData() or "")
+            microfono=self.mic.currentData() or "", traducir_en=self.sw_en.isChecked(), tonos=tonos)
         save()
         if not set_autostart(cfg["inicio_windows"]):
             self._alert("Inicio con Windows", "Guardé el resto, pero no pude anotar el inicio automático. Probá de nuevo.")
         wanted = cfg["atajo"]
         if not register_hotkey(announce=False) or cfg.get("atajo") != wanted:
             self.hotkey = cfg.get("atajo") or "ctrl+alt+space"
-            self.hk_label.setText(pretty_hotkey(self.hotkey))
+            self.hotkey_cmd = cfg.get("atajo_cmd") or self.hotkey_cmd
+            self.hotkey_write = cfg.get("atajo_escribir") or self.hotkey_write
+            self._sync_hotkey_labels()
             self._alert("Atajo", "Esa combinación no funciona. Probá otra o dejá Ctrl + Alt + Espacio.")
             if not hk:
                 return
+        self.hotkey_cmd = cfg.get("atajo_cmd") or self.hotkey_cmd
+        self.hotkey_write = cfg.get("atajo_escribir") or self.hotkey_write
+        self._sync_hotkey_labels()
         if old_model != cfg["modelo"]:
             global _model
             _model = None
@@ -1507,7 +2098,7 @@ class Settings(QWidget):
             self.footer_msg.setText("Guardado.")
         if cfg["modo"] == "local" or not cfg["groq_key"]:
             threading.Thread(target=_preload, daemon=True).start()
-        QTimer.singleShot(2200, lambda: self.footer_msg.setText("El atajo, la voz y el micrófono se aplican al guardar."))
+        QTimer.singleShot(2200, lambda: self.footer_msg.setText("Los cambios se aplican al guardar."))
 
     def _alert(self, title, text):
         box = QMessageBox(self)
@@ -1687,10 +2278,12 @@ class App(QObject):
         self.act_check.triggered.connect(lambda: threading.Thread(target=check_update, args=(True,), daemon=True).start())
         self.act_cfg = QAction("Configuración", self.menu)
         self.act_cfg.triggered.connect(lambda: self.open_settings(0))
+        self.act_write = QAction("Escritura", self.menu)
+        self.act_write.triggered.connect(lambda: self.open_settings(3))
         self.act_hist = QAction("Historial", self.menu)
-        self.act_hist.triggered.connect(lambda: self.open_settings(3))
+        self.act_hist.triggered.connect(lambda: self.open_settings(4))
         self.act_stats = QAction("Métricas", self.menu)
-        self.act_stats.triggered.connect(lambda: self.open_settings(4))
+        self.act_stats.triggered.connect(lambda: self.open_settings(5))
         self.act_log = QAction("Abrir registro de errores", self.menu)
         self.act_log.triggered.connect(self._open_log)
         self.act_quit = QAction("Salir", self.menu)
@@ -1699,6 +2292,7 @@ class App(QObject):
             self.menu.addAction(act)
         self.menu.addSeparator()
         self.menu.addAction(self.act_cfg)
+        self.menu.addAction(self.act_write)
         self.menu.addAction(self.act_hist)
         self.menu.addAction(self.act_stats)
         self.menu.addSeparator()
@@ -1721,6 +2315,8 @@ class App(QObject):
             "grabando": "Escuchando", "procesando": "Procesando", "cargando": "Preparando la voz",
             "listo": "Listo", "corto": "Muy corto", "vacio": "No se escuchó", "error": "Error",
             "cancelado": "Cancelado", "actualizando": "Actualizando",
+            "comando": "Comando", "escribir": "Ayuda", "formal": "Tono formal",
+            "mensaje": "Tono chat", "tecnico": "Tono técnico",
         }
         label = names.get(tip or state, "Listo")
         self.tray.setToolTip(f"{APP} — {label}")
@@ -1841,14 +2437,22 @@ def _welcome():
         "Si querés, en Configuración podés pegar una clave gratis de Groq para dictar más rápido por internet.",
         "Entendido")
 
-def _whats_new():
+def _whats_new(mention_pill=False):
+    pill = "Al dictar, aparece una pastilla abajo en el centro con la onda de tu voz.\n\n" if mention_pill else ""
+    cmd = pretty_hotkey(cfg.get("atajo_cmd") or "ctrl+alt+shift+space")
+    write = pretty_hotkey(cfg.get("atajo_escribir") or "ctrl+alt+a")
     if _dialog(
         APP,
-        "Dictado Libre se actualizó.\n\nCuando dictás, aparece una pastilla abajo en el centro con la onda de tu voz.\n\n"
-        "El historial, el micrófono y tus números están en el ícono junto al reloj.",
-        "Abrir configuración"):
+        pill + "Ahora el texto se acomoda solo.\n\n"
+        "Si te corregís («martes… no, mejor jueves a las 4»), queda la versión final. "
+        "Si pedís una lista o un párrafo, lo arma.\n\n"
+        "El tono sigue al programa: formal en el correo y en Word, chat en WhatsApp o Slack, técnico en el código. "
+        "Lo cambiás en Escritura.\n\n"
+        f"Comando: seleccioná un texto, mantené {cmd} y decí qué hacer.\n\n"
+        f"Ayudame a escribir: {write} y dictá la idea del mensaje.",
+        "Abrir Escritura"):
         if controller is not None:
-            controller.open_settings(0)
+            controller.open_settings(3)
 
 def main():
     global bridge
@@ -1881,9 +2485,12 @@ def main():
         cfg["primera_vez"] = False
         save()
         QTimer.singleShot(400, lambda: (_welcome(), controller.open_settings(0)))
-    elif cfg.pop("_from_old", False):
-        save()
-        QTimer.singleShot(500, _whats_new)
+    else:
+        mention_pill = bool(cfg.pop("_from_old", False))
+        mention_write = bool(cfg.pop("_from_12", False))
+        if mention_pill or mention_write:
+            save()
+            QTimer.singleShot(500, lambda p=mention_pill: _whats_new(p))
     code = app.exec()
     try:
         if controller is not None:
