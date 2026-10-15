@@ -1,0 +1,35 @@
+name: Build y Release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - name: Versión
+        shell: bash
+        run: |
+          V="${GITHUB_REF_NAME#v}"; [[ "$V" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || V="0.0.0"
+          echo "V=$V" >> $GITHUB_ENV
+          sed -i "s/^VERSION = .*/VERSION = \"$V\"/" DictadoLibre.py
+      - run: pip install -r requirements.txt
+      - name: PyInstaller (onedir)
+        run: pyinstaller --noconfirm --onedir --windowed --name DictadoLibre --icon icon.ico --collect-all faster_whisper --collect-all ctranslate2 --collect-binaries av --hidden-import pystray._win32 DictadoLibre.py
+      - name: Inno Setup
+        run: |
+          choco install innosetup -y --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyVersion=$env:V" installer.iss
+      - uses: actions/upload-artifact@v4
+        with: { name: DictadoLibre-Setup, path: Output/DictadoLibre-Setup.exe }
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Output/DictadoLibre-Setup.exe
+          generate_release_notes: true

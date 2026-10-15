@@ -1,0 +1,9 @@
+faster-whisper
+numpy<2
+sounddevice
+keyboard
+pyperclip
+pystray
+pillow
+requests
+pyinstaller
