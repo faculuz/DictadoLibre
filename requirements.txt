@@ -3,7 +3,6 @@ numpy<2
 sounddevice
 keyboard
 pyperclip
-pystray
-pillow
+PySide6
 requests
 pyinstaller

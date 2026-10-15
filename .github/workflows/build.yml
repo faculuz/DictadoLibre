@@ -20,7 +20,7 @@ jobs:
           sed -i "s/^VERSION = .*/VERSION = \"$V\"/" DictadoLibre.py
       - run: pip install -r requirements.txt
       - name: PyInstaller (onedir)
-        run: pyinstaller --noconfirm --onedir --windowed --name DictadoLibre --icon icon.ico --collect-all faster_whisper --collect-all ctranslate2 --collect-binaries av --hidden-import pystray._win32 DictadoLibre.py
+        run: pyinstaller --noconfirm --onedir --windowed --name DictadoLibre --icon icon.ico --collect-all faster_whisper --collect-all ctranslate2 --collect-binaries av --collect-all PySide6 --add-data "icon.ico;." DictadoLibre.py
       - name: Inno Setup
         run: |
           choco install innosetup -y --no-progress
