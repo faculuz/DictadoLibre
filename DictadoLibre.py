@@ -14,11 +14,11 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QLineEdit, QComboBox, QFrame, QStackedWidget, QSystemTrayIcon, QMenu,
-    QMessageBox, QScrollArea,
+    QMessageBox, QScrollArea, QPlainTextEdit,
 )
 
 APP = "Dictado Libre"
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 REPO = "faculuz/DictadoLibre"
 AUMID = "FacundoLuzardo.DictadoLibre"
 DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "DictadoLibre")
@@ -36,6 +36,7 @@ DEFAULT = {
     "modo_tecla": "mantener", "estilo": "mantener", "tono": "auto", "modelo": "small", "idioma": "es",
     "sonidos": True, "inicio_windows": False, "primera_vez": True, "microfono": "",
     "traducir_en": False, "tonos": {},
+    "diccionario": [], "fragmentos": [], "susurro": False, "privacidad": False, "aprender": True,
 }
 MODELS = [
     ("base", "Rápida"),
@@ -79,6 +80,7 @@ DEFAULT_TONOS = {exe: tone for exe, tone, _name in APP_RULES}
 APP_NAMES = {exe: name for exe, _tone, name in APP_RULES}
 TONE_EDIT = [("mantener", "Como lo dije"), ("formal", "Formal"), ("mensaje", "Chat"), ("tecnico", "Técnico")]
 TONE_ALL = [("auto", "Según la aplicación")] + TONE_EDIT
+DICT_TYPES = [("nombre", "Nombre"), ("sigla", "Sigla"), ("jerga", "Jerga")]
 WEEKDAYS = r"lunes|martes|mi[eé]rcoles|jueves|viernes|s[aá]bado|domingo"
 HOUR_WORDS = {"un": 1, "una": 1, "dos": 2, "tres": 3, "cuatro": 4, "cinco": 5, "seis": 6,
               "siete": 7, "ocho": 8, "nueve": 9, "diez": 10, "once": 11, "doce": 12}
@@ -108,6 +110,49 @@ def _write_json(path, data):
         json.dump(data, f, ensure_ascii=False, indent=2)
     os.replace(tmp, path)
 
+def _clean_dict_entries(raw):
+    out, seen = [], set()
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if isinstance(item, str):
+            item = {"escribe": item}
+        if not isinstance(item, dict):
+            continue
+        escribe = " ".join(str(item.get("escribe") or item.get("palabra") or "").split())
+        if not escribe or len(escribe) > 80:
+            continue
+        oye = " ".join(str(item.get("oye") or "").split())[:80]
+        tipo = item.get("tipo") if item.get("tipo") in ("nombre", "sigla", "jerga") else "jerga"
+        key = escribe.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"escribe": escribe, "oye": oye, "tipo": tipo})
+        if len(out) >= 200:
+            break
+    return out
+
+def _clean_snippets(raw):
+    out, seen = [], set()
+    if not isinstance(raw, list):
+        return out
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        frase = " ".join(str(item.get("frase") or "").split())
+        texto = str(item.get("texto") or "").strip()
+        if not frase or not texto or len(frase) > 80 or len(texto) > 4000:
+            continue
+        key = frase.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append({"frase": frase, "texto": texto})
+        if len(out) >= 80:
+            break
+    return out
+
 def load():
     raw = _read_json(CFG, {})
     if not isinstance(raw, dict):
@@ -119,9 +164,15 @@ def load():
         c["tono"] = est if est in ("formal", "mensaje", "tecnico") else "auto"
     if not isinstance(c.get("tonos"), dict):
         c["tonos"] = {}
+    c["diccionario"] = _clean_dict_entries(c.get("diccionario"))
+    c["fragmentos"] = _clean_snippets(c.get("fragmentos"))
+    c["susurro"] = bool(c.get("susurro"))
+    c["privacidad"] = bool(c.get("privacidad"))
+    c["aprender"] = bool(c.get("aprender", True))
     fresh = not c.get("primera_vez", True) and os.path.exists(CFG)
     c["_from_old"] = fresh and "microfono" not in raw
     c["_from_12"] = fresh and "atajo_cmd" not in raw
+    c["_from_13"] = fresh and "diccionario" not in raw
     return c
 
 cfg = load()
@@ -237,6 +288,7 @@ hotkeys = {}
 capturing = False
 session_kind = "dictado"
 session_tone = "mantener"
+learn_gen = 0
 mic_lock = threading.RLock()
 level_lock = threading.Lock()
 levels = [0.08] * BAR_N
@@ -284,11 +336,126 @@ def local_model():
                 set_state("listo", "")
         return _model
 
+def _word_pat(term):
+    return r"(?i)(?<!\w)" + re.escape(term.strip()) + r"(?!\w)"
+
+def whisper_prompt():
+    base = "Hola, ¿cómo estás? Esto es un dictado en español, con puntuación correcta."
+    words = []
+    for entry in cfg.get("diccionario") or []:
+        word = " ".join(str(entry.get("escribe") or "").split())
+        if word and word not in words:
+            words.append(word)
+    if not words:
+        return base
+    extra = ", ".join(words)
+    if len(extra) > 350:
+        extra = extra[:350].rsplit(",", 1)[0]
+    return base + " Nombres y términos: " + extra + "."
+
+def vocab_clause():
+    bits = []
+    for entry in cfg.get("diccionario") or []:
+        write = (entry.get("escribe") or "").strip()
+        if not write:
+            continue
+        heard = (entry.get("oye") or "").strip()
+        if heard and heard.lower() != write.lower():
+            bits.append(f"«{heard}» se escribe «{write}»")
+        else:
+            bits.append(write)
+        if len(bits) >= 40:
+            break
+    if not bits:
+        return ""
+    line = " Vocabulario de esta persona: respetalo tal cual. " + "; ".join(bits) + "."
+    return line[:1500]
+
+def snippet_clause():
+    bits = []
+    for item in cfg.get("fragmentos") or []:
+        frase = (item.get("frase") or "").strip()
+        if frase:
+            bits.append(f"«{frase}»")
+        if len(bits) >= 20:
+            break
+    if not bits:
+        return ""
+    return " No reescribas estas frases, dejálas literales: " + ", ".join(bits) + "."
+
+def apply_dictionary(text):
+    out = text or ""
+    entries = [e for e in (cfg.get("diccionario") or []) if (e.get("oye") or "").strip() and (e.get("escribe") or "").strip()]
+    entries.sort(key=lambda e: len(e.get("oye") or ""), reverse=True)
+    for entry in entries:
+        heard, write = entry["oye"].strip(), entry["escribe"].strip()
+        if heard.lower() == write.lower():
+            continue
+        out = re.sub(_word_pat(heard), lambda _m, write=write: write, out)
+    return out
+
+def exact_snippet(raw):
+    folded = " ".join((raw or "").split()).strip(" .!?¡¿")
+    if not folded:
+        return None
+    for item in cfg.get("fragmentos") or []:
+        frase = " ".join((item.get("frase") or "").split()).strip(" .!?¡¿")
+        if frase and folded.lower() == frase.lower():
+            return item.get("texto") or ""
+    return None
+
+def apply_snippets(text):
+    out = text or ""
+    items = [s for s in (cfg.get("fragmentos") or []) if (s.get("frase") or "").strip() and (s.get("texto") or "").strip()]
+    items.sort(key=lambda s: len(s["frase"]), reverse=True)
+    parked = []
+    for i, item in enumerate(items):
+        token = f"\u0000SN{i}\u0000"
+        expansion = item["texto"]
+
+        def repl(_m, token=token, expansion=expansion):
+            parked.append((token, expansion))
+            return token
+
+        out = re.sub(_word_pat(item["frase"].strip()) + r"\s*[.!?¡¿]?", repl, out)
+    for token, expansion in parked:
+        out = out.replace(token, expansion)
+    return out
+
+def prepare_audio(audio):
+    audio = np.asarray(audio)
+    if audio.size == 0:
+        return np.zeros(0, np.int16)
+    original = audio.astype(np.int16, copy=False)
+    if not cfg.get("susurro"):
+        return original
+    samples = original.astype(np.float32)
+    samples -= float(np.mean(samples))
+    peak = float(np.max(np.abs(samples))) if samples.size else 0.0
+    if peak < 180:
+        return original
+    target = 14000.0
+    if peak >= target:
+        return original
+    samples *= min(10.0, target / peak)
+    np.clip(samples, -32767, 32767, out=samples)
+    return samples.astype(np.int16)
+
+def chunk_level(chunk):
+    if chunk is None or getattr(chunk, "size", 0) == 0:
+        return 0.0
+    peak = float(np.max(np.abs(chunk))) / 32768.0
+    boost = 12.0 if cfg.get("susurro") else 4.5
+    return min(1.0, peak * boost)
+
 def transcribe_local(audio):
-    segs, _ = local_model().transcribe(
-        audio.astype(np.float32) / 32768.0, language=cfg["idioma"] or None,
-        beam_size=5, vad_filter=True,
-        initial_prompt="Hola, ¿cómo estás? Esto es un dictado en español, con puntuación correcta.")
+    audio = prepare_audio(audio)
+    kwargs = dict(
+        language=cfg["idioma"] or None, beam_size=5, vad_filter=True, initial_prompt=whisper_prompt())
+    if cfg.get("susurro"):
+        kwargs["vad_parameters"] = dict(
+            threshold=0.22, min_speech_duration_ms=80, min_silence_duration_ms=700, speech_pad_ms=480)
+    segs, _ = local_model().transcribe(audio.astype(np.float32) / 32768.0, **kwargs)
     return " ".join(s.text.strip() for s in segs).strip()
 
 def wav_bytes(audio):
@@ -298,11 +465,13 @@ def wav_bytes(audio):
     return b.getvalue()
 
 def transcribe_groq(audio):
+    audio = prepare_audio(audio)
     r = requests.post(
         "https://api.groq.com/openai/v1/audio/transcriptions",
         headers={"Authorization": "Bearer " + cfg["groq_key"].strip()},
         files={"file": ("a.wav", wav_bytes(audio), "audio/wav")},
-        data={"model": "whisper-large-v3-turbo", "language": cfg["idioma"], "response_format": "json"},
+        data={"model": "whisper-large-v3-turbo", "language": cfg["idioma"], "response_format": "json",
+              "prompt": whisper_prompt()[:500]},
         timeout=30)
     r.raise_for_status()
     return r.json()["text"].strip()
@@ -561,7 +730,8 @@ def prompt_dictado(tone):
         "- Si pide párrafos ('punto y aparte', 'nuevo párrafo') o una lista ('viñeta', 'primero, segundo'), "
         "formateá con saltos de línea, '- ' o '1. '.\n"
         "- No inventes datos, no respondas preguntas y no agregues explicaciones. Devolvé solo el texto final.\n"
-        "- " + ESTILOS.get(tone, ESTILOS["mantener"]) + _english_line(cfg.get("traducir_en")))
+        "- " + ESTILOS.get(tone, ESTILOS["mantener"]) + _english_line(cfg.get("traducir_en"))
+        + vocab_clause() + snippet_clause())
 
 def prompt_command(tone):
     return (
@@ -569,17 +739,27 @@ def prompt_command(tone):
         "Aplicá la instrucción a ese texto y devolvé solo el resultado, sin comillas ni explicación. "
         "Podés corregir, resumir, cambiar el tono, traducir, pasar a viñetas o reescribir. "
         "No inventes datos que no estén en el texto o en la instrucción.\n"
-        "- " + ESTILOS.get(tone, ESTILOS["mantener"]) + _english_line(cfg.get("traducir_en")))
+        "- " + ESTILOS.get(tone, ESTILOS["mantener"]) + _english_line(cfg.get("traducir_en"))
+        + vocab_clause())
 
 def prompt_escribir(tone):
     return (
         "La persona dictó una instrucción corta para redactar un mensaje. Escribí el mensaje completo, listo para enviar. "
         "No expliques lo que hiciste. No inventes nombres, fechas, lugares ni números que no estén en la instrucción.\n"
-        "- " + ESTILOS.get(tone, ESTILOS["mantener"]) + _english_line(cfg.get("traducir_en")))
+        "- " + ESTILOS.get(tone, ESTILOS["mantener"]) + _english_line(cfg.get("traducir_en"))
+        + vocab_clause())
+
+def _cloud_key():
+    return bool((cfg.get("groq_key") or "").strip()) and not cfg.get("privacidad")
+
+def _spanish_notice():
+    if cfg.get("privacidad"):
+        return "La privacidad está activa, así que no uso Groq. Dejé el texto en español."
+    return "Para escribir en inglés hace falta la clave gratis de Groq. Dejé el texto en español."
 
 def shape_text(raw, kind, selected, tone):
     english = bool(cfg.get("traducir_en"))
-    has_key = bool((cfg.get("groq_key") or "").strip())
+    has_key = _cloud_key()
     if kind == "dictado" and not cfg.get("pulir", True):
         text = (raw or "").strip()
         if english and has_key:
@@ -589,7 +769,7 @@ def shape_text(raw, kind, selected, tone):
                 log("traduccion", e)
                 notify("Groq no respondió. Dejé el texto en español.")
         elif english:
-            notify("Para escribir en inglés hace falta la clave gratis de Groq. Dejé el texto en español.")
+            notify(_spanish_notice())
         return text
     elif has_key:
         try:
@@ -607,18 +787,21 @@ def shape_text(raw, kind, selected, tone):
             if english or kind != "dictado":
                 notify("Groq no respondió. Sigo con lo que puedo hacer en esta computadora.")
     elif english and kind == "dictado":
-        notify("Para escribir en inglés hace falta la clave gratis de Groq. Dejé el texto en español.")
+        notify(_spanish_notice())
     if kind == "comando":
         text = command_local(selected, raw)
         if text is None:
-            notify("Traducir el texto necesita la clave de Groq. No lo cambié.")
+            if cfg.get("privacidad"):
+                notify("Traducir necesita Groq, y la privacidad lo deja apagado. No lo cambié.")
+            else:
+                notify("Traducir el texto necesita la clave de Groq. No lo cambié.")
             return ""
         if english and not has_key:
-            notify("Para dejarlo en inglés hace falta la clave de Groq. Apliqué el cambio en español.")
+            notify(_spanish_notice())
         return text
     if kind == "escribir":
         if english and not has_key:
-            notify("Para escribir en inglés hace falta la clave de Groq. Armé el mensaje en español.")
+            notify(_spanish_notice())
         return help_local(raw, tone)
     return polish_text_local(raw, tone)
 
@@ -677,7 +860,7 @@ def process(audio):
                 notify("Primero seleccioná el texto. Después usá el atajo de comando y decí qué hacer.")
                 set_state("listo", "vacio")
                 return
-        online = cfg.get("modo") == "online" and (cfg.get("groq_key") or "").strip()
+        online = cfg.get("modo") == "online" and _cloud_key()
         if online:
             try:
                 raw = transcribe_groq(audio)
@@ -691,7 +874,12 @@ def process(audio):
         if not (raw or "").strip():
             set_state("listo", "vacio")
             return
-        text = shape_text(raw.strip(), kind, selected, tone)
+        raw = apply_dictionary(raw.strip())
+        if kind == "dictado":
+            direct = exact_snippet(raw)
+            text = direct if direct else apply_snippets(apply_dictionary(shape_text(raw, kind, selected, tone)))
+        else:
+            text = shape_text(raw, kind, selected, tone)
         if abort.is_set():
             return
         if text:
@@ -714,7 +902,216 @@ def process(audio):
         if controller is not None:
             controller.maybe_monitor()
 
-def paste(text):
+def _text_words(text):
+    return re.findall(r"[0-9A-Za-zÁÉÍÓÚÜÑáéíóúüñ]+", text or "")
+
+def one_word_change(before, after):
+    bw, aw = _text_words(before), _text_words(after)
+    if not bw or not aw:
+        return None
+    i = 0
+    while i < len(bw) and i < len(aw) and bw[i] == aw[i]:
+        i += 1
+    j = 0
+    while j < (len(bw) - i) and j < (len(aw) - i) and bw[-1 - j] == aw[-1 - j]:
+        j += 1
+    old = bw[i:len(bw) - j if j else len(bw)]
+    new = aw[i:len(aw) - j if j else len(aw)]
+    if len(old) == 1 and len(new) == 1 and old[0] != new[0]:
+        return old[0], new[0]
+    return None
+
+def correction_pair(pasted, before, after):
+    change = one_word_change(before, after)
+    if not change:
+        return None
+    old, new = change
+    if len(old) < 2 or len(new) < 2 or len(old) > 40 or len(new) > 40:
+        return None
+    if not re.search(_word_pat(old), pasted or ""):
+        return None
+    return old, new
+
+def _known_correction(old, new):
+    for entry in cfg.get("diccionario") or []:
+        heard = (entry.get("oye") or "").strip()
+        write = (entry.get("escribe") or "").strip()
+        if heard.lower() == old.lower() and write == new:
+            return True
+    return False
+
+def add_dictionary_correction(oye, escribe):
+    items = [dict(e) for e in (cfg.get("diccionario") or [])]
+    placed = False
+    for entry in items:
+        write = (entry.get("escribe") or "").strip()
+        heard = (entry.get("oye") or "").strip()
+        if heard.lower() == oye.lower() or (write.lower() == escribe.lower() and (not heard or heard.lower() == oye.lower())):
+            entry["escribe"] = escribe
+            entry["oye"] = oye
+            if entry.get("tipo") not in ("nombre", "sigla", "jerga"):
+                entry["tipo"] = "nombre" if escribe[:1].isupper() else "jerga"
+            placed = True
+            break
+    if not placed:
+        items.append({
+            "escribe": escribe, "oye": oye,
+            "tipo": "nombre" if escribe[:1].isupper() else "jerga",
+        })
+    cfg["diccionario"] = _clean_dict_entries(items)
+    save()
+    if controller is not None and getattr(controller, "settings", None) is not None:
+        try:
+            controller.settings.note_learned(oye, escribe)
+        except Exception as e:
+            log("diccionario", repr(e))
+
+def _offer_correction(old, new):
+    if not old or not new or _known_correction(old, new):
+        return
+    if bridge is not None:
+        bridge.learn_offer.emit(old, new)
+
+def _focused_control_text():
+    if os.name != "nt":
+        return None, "", False
+    try:
+        user32 = ctypes.windll.user32
+
+        class RECT(ctypes.Structure):
+            _fields_ = [("left", ctypes.c_long), ("top", ctypes.c_long), ("right", ctypes.c_long), ("bottom", ctypes.c_long)]
+
+        class GUITHREADINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", ctypes.c_ulong), ("flags", ctypes.c_ulong),
+                ("hwndActive", ctypes.c_void_p), ("hwndFocus", ctypes.c_void_p),
+                ("hwndCapture", ctypes.c_void_p), ("hwndMenuOwner", ctypes.c_void_p),
+                ("hwndMoveSize", ctypes.c_void_p), ("hwndCaret", ctypes.c_void_p),
+                ("rcCaret", RECT),
+            ]
+
+        user32.GetForegroundWindow.restype = ctypes.c_void_p
+        user32.GetWindowThreadProcessId.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        user32.GetWindowThreadProcessId.restype = ctypes.c_ulong
+        user32.GetGUIThreadInfo.argtypes = [ctypes.c_ulong, ctypes.c_void_p]
+        user32.GetGUIThreadInfo.restype = ctypes.c_bool
+        user32.SendMessageW.argtypes = [ctypes.c_void_p, ctypes.c_uint, ctypes.c_size_t, ctypes.c_wchar_p]
+        user32.SendMessageW.restype = ctypes.c_ssize_t
+        hwnd = user32.GetForegroundWindow()
+        tid = user32.GetWindowThreadProcessId(hwnd, None)
+        info = GUITHREADINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not user32.GetGUIThreadInfo(tid, ctypes.byref(info)):
+            return None, "", False
+        target = info.hwndFocus or hwnd
+        n = int(user32.SendMessageW(target, 0x000E, 0, None) or 0)
+        if n <= 0 or n > 20000:
+            return target, "", False
+        buf = ctypes.create_unicode_buffer(n + 1)
+        user32.SendMessageW(target, 0x000D, n + 1, buf)
+        return target, buf.value or "", True
+    except Exception as e:
+        log("texto", repr(e))
+        return None, "", False
+
+def _watch_windows_text(pasted, gen):
+    target, before, readable = _focused_control_text()
+    if not readable or pasted.strip() not in (before or ""):
+        return None, False
+    deadline = time.time() + 8
+    last, stable = before, None
+    while time.time() < deadline and gen == learn_gen:
+        time.sleep(0.35)
+        now_target, text, still = _focused_control_text()
+        if not still or now_target != target:
+            break
+        if text != last:
+            last, stable = text, time.time()
+        elif stable and text != before and time.time() - stable > 1.1:
+            break
+    if last == before:
+        return None, True
+    return correction_pair(pasted, before, last), True
+
+def _watch_keys(pasted, gen, box):
+    shadow = {"text": pasted, "ok": True, "mods": 0}
+    original = pasted
+    blocking = {"ctrl", "alt", "windows", "left windows", "right windows", "right ctrl", "left ctrl", "right alt", "left alt"}
+
+    def handler(event):
+        if gen != learn_gen:
+            return
+        name = event.name or ""
+        if name in blocking or name in ("shift", "right shift", "left shift"):
+            if name in blocking:
+                if event.event_type == "down":
+                    shadow["mods"] += 1
+                elif shadow["mods"]:
+                    shadow["mods"] -= 1
+            return
+        if box.get("stop") or not shadow["ok"] or event.event_type != "down":
+            return
+        if shadow["mods"]:
+            shadow["ok"] = False
+            return
+        if name in ("backspace",):
+            shadow["text"] = shadow["text"][:-1]
+        elif name in ("space", "spacebar"):
+            shadow["text"] += " "
+        elif name == "enter":
+            shadow["text"] += "\n"
+        elif len(name) == 1:
+            shadow["text"] += name
+        else:
+            shadow["ok"] = False
+
+    try:
+        hook = keyboard.hook(handler, suppress=False)
+    except Exception as e:
+        log("aprender", repr(e))
+        return
+    try:
+        end = time.time() + 8
+        last, stable = shadow["text"], None
+        while time.time() < end and not box.get("stop") and shadow["ok"] and gen == learn_gen:
+            time.sleep(0.2)
+            cur = shadow["text"]
+            if cur != last:
+                last, stable = cur, time.time()
+            elif stable and cur != original and time.time() - stable > 1.0:
+                break
+        if shadow["ok"] and shadow["text"] != original and gen == learn_gen:
+            box["pair"] = correction_pair(original, original, shadow["text"])
+    finally:
+        try:
+            keyboard.unhook(hook)
+        except Exception:
+            pass
+
+def watch_correction(pasted, gen):
+    try:
+        if not cfg.get("aprender", True) or gen != learn_gen:
+            return
+        time.sleep(0.35)
+        if gen != learn_gen:
+            return
+        box = {"stop": False, "pair": None}
+        threading.Thread(target=_watch_keys, args=(pasted, gen, box), daemon=True).start()
+        pair, readable = (None, False)
+        if os.name == "nt":
+            pair, readable = _watch_windows_text(pasted, gen)
+        box["stop"] = True
+        time.sleep(0.3)
+        if gen != learn_gen:
+            return
+        if pair:
+            _offer_correction(*pair)
+        elif not readable and box.get("pair"):
+            _offer_correction(*box["pair"])
+    except Exception as e:
+        log("aprender", repr(e))
+
+def paste(text, watch=True):
     with paste_lock:
         try:
             old = pyperclip.paste()
@@ -733,12 +1130,12 @@ def paste(text):
         time.sleep(0.3)
         if old is not None:
             threading.Timer(0.7, lambda o=old: pyperclip.copy(o)).start()
+    if watch and cfg.get("aprender", True) and (text or "").strip():
+        inserted = text if text.endswith((" ", "\n")) else text + " "
+        threading.Thread(target=watch_correction, args=(inserted, learn_gen), daemon=True).start()
 
 def push_level(chunk):
-    if chunk is None or getattr(chunk, "size", 0) == 0:
-        return
-    peak = float(np.max(np.abs(chunk))) / 32768.0
-    v = min(1.0, peak * 4.5)
+    v = chunk_level(chunk)
     if v < 0.06:
         v = 0.08
     with level_lock:
@@ -790,7 +1187,7 @@ def cb(indata, n, t, status):
         push_level(indata)
 
 def start_rec():
-    global recording, frames, stream
+    global recording, frames, stream, learn_gen
     if recording or capturing:
         return
     with mic_lock:
@@ -798,6 +1195,7 @@ def start_rec():
             return
         if controller is not None:
             controller._stop_monitor()
+        learn_gen += 1
         abort.clear()
         with level_lock:
             for i in range(len(levels)):
@@ -1114,10 +1512,10 @@ QPushButton#nav:checked { background: #2a2740; color: white; font-weight: 600; }
 QPushButton#danger { background: #2a2030; color: #ff8b9a; }
 QPushButton#danger:hover { background: #3a2230; }
 QPushButton#chip { background: #252836; color: #f4f5f7; border-radius: 10px; padding: 6px 12px; }
-QLineEdit, QComboBox {
+QLineEdit, QComboBox, QPlainTextEdit {
     background: #12141c; color: #f4f5f7; border: 1px solid #343848; border-radius: 12px; padding: 8px 12px; min-height: 22px;
 }
-QLineEdit:focus, QComboBox:focus { border: 1px solid #7c6af7; }
+QLineEdit:focus, QComboBox:focus, QPlainTextEdit:focus { border: 1px solid #7c6af7; }
 QComboBox::drop-down { border: none; width: 28px; }
 QComboBox QAbstractItemView { background: #1b1e27; color: #f4f5f7; selection-background-color: #7c6af7; border: 1px solid #343848; }
 QScrollBar:vertical { background: #1a1d27; width: 12px; margin: 4px 2px; border-radius: 6px; }
@@ -1132,6 +1530,7 @@ class Bridge(QObject):
     update_ready = Signal()
     history_changed = Signal()
     mic_level = Signal(float)
+    learn_offer = Signal(str, str)
 
 class Pill(QWidget):
     def __init__(self):
@@ -1509,6 +1908,7 @@ class Settings(QWidget):
         self.stack.addWidget(scroller(self._page_voz()))
         self.stack.addWidget(scroller(self._page_mic()))
         self.stack.addWidget(scroller(self._page_write()))
+        self.stack.addWidget(scroller(self._page_words()))
         self.stack.addWidget(scroller(self._page_hist()))
         self.stack.addWidget(scroller(self._page_stats()))
         right.addWidget(self.stack, 1)
@@ -1546,7 +1946,7 @@ class Settings(QWidget):
         lay.addWidget(ver)
         lay.addSpacing(18)
         self.nav = []
-        for i, text in enumerate(("General", "Voz", "Micrófono", "Escritura", "Historial", "Métricas")):
+        for i, text in enumerate(("General", "Voz", "Micrófono", "Escritura", "Palabras", "Historial", "Métricas")):
             b = button(text, "nav")
             b.setCheckable(True)
             b.clicked.connect(lambda _=False, n=i: self.open_page(n))
@@ -1617,6 +2017,11 @@ class Settings(QWidget):
         self.sw_ini = Switch(cfg.get("inicio_windows", False))
         lay.addWidget(switch_row("Sonido", "Un tono corto al empezar y al soltar.", self.sw_son))
         lay.addWidget(switch_row("Abrir con Windows", "Dictado Libre queda listo junto al reloj cuando prendés la computadora.", self.sw_ini))
+        self.sw_priv = Switch(bool(cfg.get("privacidad")))
+        lay.addWidget(switch_row(
+            "Privacidad",
+            "El diccionario, los fragmentos y el historial siempre quedan en esta computadora. Si lo activás, el audio y el texto tampoco salen: no se usa Groq. Buscar actualizaciones sigue igual.",
+            self.sw_priv))
         lay.addStretch(1)
         return page
 
@@ -1653,7 +2058,7 @@ class Settings(QWidget):
         tools.addStretch(1)
         tools.addLayout(show_row)
         bl.addLayout(tools)
-        bl.addWidget(muted("Groq es gratis. La clave también acomoda el texto, el comando y Ayudame a escribir, aunque dictes en esta computadora. Sin clave, eso se hace acá, más simple."))
+        bl.addWidget(muted("Groq es gratis. La clave también acomoda el texto, el comando y Ayudame a escribir, aunque dictes en esta computadora. Sin clave, eso se hace acá, más simple. Con Privacidad, en General, el audio y el texto no salen de esta computadora."))
         lay.addWidget(box)
         box2 = card()
         b2 = QVBoxLayout(box2)
@@ -1824,6 +2229,139 @@ class Settings(QWidget):
         self._add_tone_row(name, self.exe_tone.currentData() or "formal", removable=True)
         self.exe_edit.clear()
 
+    def _page_words(self):
+        page, lay = self._page_shell(
+            "Palabras",
+            "Nombres, siglas y jerga para que el dictado las escriba bien. Una frase corta puede pegar un texto largo.")
+        self.sw_learn = Switch(bool(cfg.get("aprender", True)))
+        lay.addWidget(switch_row(
+            "Ofrecer correcciones",
+            "Si cambiás una palabra justo después de pegar, y se puede ver el cambio, te pregunto si la guardo. En algunos programas no se puede leer el texto.",
+            self.sw_learn))
+        box = card()
+        bl = QVBoxLayout(box)
+        bl.setContentsMargins(18, 14, 18, 14)
+        bl.setSpacing(8)
+        bl.addWidget(QLabel("Diccionario"))
+        bl.addWidget(muted("Por ejemplo: Facundo, Groq, Kubernetes. Si el micrófono lo escucha distinto, anotá también cómo suena."))
+        self.dict_box = QVBoxLayout()
+        self.dict_box.setSpacing(8)
+        bl.addLayout(self.dict_box)
+        self._dict_rows = []
+        for entry in cfg.get("diccionario") or []:
+            self._add_dict_row(entry)
+        add = button("Agregar palabra", "ghost")
+        add.clicked.connect(lambda: self._add_dict_row({"escribe": "", "oye": "", "tipo": "nombre"}))
+        bl.addWidget(add, 0, Qt.AlignLeft)
+        lay.addWidget(box)
+        snippets = card()
+        sl = QVBoxLayout(snippets)
+        sl.setContentsMargins(18, 14, 18, 14)
+        sl.setSpacing(8)
+        sl.addWidget(QLabel("Fragmentos de voz"))
+        sl.addWidget(muted("Si decís la frase, se reemplaza por el texto. Por ejemplo, frase «mi mail» y abajo tu dirección. Se pega tal cual lo escribiste."))
+        self.snip_box = QVBoxLayout()
+        self.snip_box.setSpacing(8)
+        sl.addLayout(self.snip_box)
+        self._snip_rows = []
+        for item in cfg.get("fragmentos") or []:
+            self._add_snip_row(item)
+        add_s = button("Agregar fragmento", "ghost")
+        add_s.clicked.connect(lambda: self._add_snip_row({"frase": "", "texto": ""}))
+        sl.addWidget(add_s, 0, Qt.AlignLeft)
+        lay.addWidget(snippets)
+        lay.addStretch(1)
+        return page
+
+    def _add_dict_row(self, entry):
+        row = card()
+        lay = QVBoxLayout(row)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(6)
+        top = QHBoxLayout()
+        escribe = QLineEdit(entry.get("escribe") or "")
+        escribe.setPlaceholderText("Cómo se escribe")
+        tipo = QComboBox()
+        polish_combo(tipo)
+        fill_combo(tipo, DICT_TYPES, entry.get("tipo") or "jerga")
+        tipo.setMinimumWidth(120)
+        rm = button("Quitar", "danger")
+        top.addWidget(escribe, 1)
+        top.addWidget(tipo)
+        top.addWidget(rm)
+        oye = QLineEdit(entry.get("oye") or "")
+        oye.setPlaceholderText("Si se escucha distinto, opcional")
+        lay.addLayout(top)
+        lay.addWidget(oye)
+        item = {"escribe": escribe, "oye": oye, "tipo": tipo, "row": row}
+        rm.clicked.connect(lambda _=False, it=item: self._remove_dict_row(it))
+        self.dict_box.addWidget(row)
+        self._dict_rows.append(item)
+
+    def _remove_dict_row(self, item):
+        self.dict_box.removeWidget(item["row"])
+        item["row"].deleteLater()
+        self._dict_rows = [row for row in self._dict_rows if row is not item]
+
+    def _add_snip_row(self, entry):
+        row = card()
+        lay = QVBoxLayout(row)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(6)
+        top = QHBoxLayout()
+        frase = QLineEdit(entry.get("frase") or "")
+        frase.setPlaceholderText("Frase que decís")
+        rm = button("Quitar", "danger")
+        top.addWidget(frase, 1)
+        top.addWidget(rm)
+        texto = QPlainTextEdit(entry.get("texto") or "")
+        texto.setPlaceholderText("Texto que se pega")
+        texto.setFixedHeight(78)
+        lay.addLayout(top)
+        lay.addWidget(texto)
+        item = {"frase": frase, "texto": texto, "row": row}
+        rm.clicked.connect(lambda _=False, it=item: self._remove_snip_row(it))
+        self.snip_box.addWidget(row)
+        self._snip_rows.append(item)
+
+    def _remove_snip_row(self, item):
+        self.snip_box.removeWidget(item["row"])
+        item["row"].deleteLater()
+        self._snip_rows = [row for row in self._snip_rows if row is not item]
+
+    def _collect_dict(self):
+        items = []
+        for row in list(self._dict_rows):
+            try:
+                items.append({
+                    "escribe": row["escribe"].text().strip(),
+                    "oye": row["oye"].text().strip(),
+                    "tipo": row["tipo"].currentData() or "jerga",
+                })
+            except RuntimeError:
+                pass
+        return _clean_dict_entries(items)
+
+    def _collect_snips(self):
+        items = []
+        for row in list(self._snip_rows):
+            try:
+                items.append({"frase": row["frase"].text().strip(), "texto": row["texto"].toPlainText().strip()})
+            except RuntimeError:
+                pass
+        return _clean_snippets(items)
+
+    def note_learned(self, oye, escribe):
+        for row in list(self._dict_rows):
+            try:
+                if row["escribe"].text().strip().lower() == escribe.lower():
+                    row["oye"].setText(oye)
+                    row["escribe"].setText(escribe)
+                    return
+            except RuntimeError:
+                continue
+        self._add_dict_row({"escribe": escribe, "oye": oye, "tipo": "nombre" if (escribe[:1].isupper()) else "jerga"})
+
     def _page_mic(self):
         page, lay = self._page_shell("Micrófono", "Elegí con cuál querés dictar. La barra se mueve si te escucha.")
         box = card()
@@ -1842,6 +2380,11 @@ class Settings(QWidget):
         self.mic_msg = muted("Hablá ahora. Si la barra se mueve, ese micrófono sirve. Después tocá Guardar.")
         bl.addWidget(self.mic_msg)
         lay.addWidget(box)
+        self.sw_sus = Switch(bool(cfg.get("susurro")))
+        lay.addWidget(switch_row(
+            "Modo susurro",
+            "Para hablar bajito. Sube la voz y no corta las frases suaves. El ruido de fondo también puede notarse un poco más.",
+            self.sw_sus))
         lay.addStretch(1)
         self.mic.currentIndexChanged.connect(lambda *_: self._mic_changed())
         return page
@@ -1933,7 +2476,7 @@ class Settings(QWidget):
     def _select_nav(self, index):
         for i, b in enumerate(self.nav):
             b.setChecked(i == index)
-        editing = index in (0, 1, 2, 3)
+        editing = index in (0, 1, 2, 3, 4)
         self.save_btn.setVisible(editing)
         self.footer_msg.setVisible(editing)
         self.footer.setVisible(editing)
@@ -1947,9 +2490,9 @@ class Settings(QWidget):
 
     def _on_page(self, index):
         self._select_nav(index)
-        if index == 4:
+        if index == 5:
             self._refresh_history()
-        elif index == 5:
+        elif index == 6:
             self._refresh_stats()
         if controller is not None:
             if index == 2 and self.isVisible():
@@ -2074,7 +2617,9 @@ class Settings(QWidget):
             tono=tono, estilo=tono if tono != "auto" else cfg.get("estilo", "mantener"),
             idioma=self.lang.currentData() or "es",
             sonidos=self.sw_son.isChecked(), inicio_windows=self.sw_ini.isChecked(),
-            microfono=self.mic.currentData() or "", traducir_en=self.sw_en.isChecked(), tonos=tonos)
+            microfono=self.mic.currentData() or "", traducir_en=self.sw_en.isChecked(), tonos=tonos,
+            susurro=self.sw_sus.isChecked(), privacidad=self.sw_priv.isChecked(), aprender=self.sw_learn.isChecked(),
+            diccionario=self._collect_dict(), fragmentos=self._collect_snips())
         save()
         if not set_autostart(cfg["inicio_windows"]):
             self._alert("Inicio con Windows", "Guardé el resto, pero no pude anotar el inicio automático. Probá de nuevo.")
@@ -2096,7 +2641,7 @@ class Settings(QWidget):
             self.footer_msg.setText("Listo. La próxima vez se prepara la calidad nueva.")
         else:
             self.footer_msg.setText("Guardado.")
-        if cfg["modo"] == "local" or not cfg["groq_key"]:
+        if cfg["modo"] == "local" or not cfg["groq_key"] or cfg.get("privacidad"):
             threading.Thread(target=_preload, daemon=True).start()
         QTimer.singleShot(2200, lambda: self.footer_msg.setText("Los cambios se aplican al guardar."))
 
@@ -2171,7 +2716,7 @@ class Settings(QWidget):
     def _repaste(self, text, btn):
         def run():
             try:
-                paste(text)
+                paste(text, watch=False)
             except Exception as e:
                 log("reinsert", repr(e))
                 notify("No pude pegar. Hacé clic donde querés el texto y probá de nuevo.")
@@ -2257,6 +2802,60 @@ def _qt_key_name(key):
         return chr(key).lower()
     return None
 
+class LearnPopup(QWidget):
+    def __init__(self):
+        super().__init__()
+        self.old, self.new = "", ""
+        self.setObjectName("learn")
+        self.setAttribute(Qt.WA_StyledBackground, True)
+        self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+        self.setWindowFlags(Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.setStyleSheet(
+            "QWidget#learn { background:#1b1e27; border:1px solid #343848; border-radius:16px; }"
+            "QLabel { color:#f4f5f7; }")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.setSpacing(10)
+        self.label = QLabel("")
+        self.label.setWordWrap(True)
+        self.label.setMaximumWidth(380)
+        lay.addWidget(self.label)
+        row = QHBoxLayout()
+        yes = button("Guardar", "primary")
+        no = button("Ahora no", "ghost")
+        yes.clicked.connect(self._save)
+        no.clicked.connect(self.hide)
+        row.addWidget(yes)
+        row.addWidget(no)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self._timer = QTimer(self)
+        self._timer.setSingleShot(True)
+        self._timer.timeout.connect(self.hide)
+
+    def offer(self, old, new):
+        self.old, self.new = old, new
+        self.label.setText(f"Cambiaste «{old}» por «{new}». ¿Lo guardo en el diccionario?")
+        self.adjustSize()
+        self._place()
+        self.show()
+        self.raise_()
+        self._timer.start(14000)
+
+    def _place(self):
+        screen = QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        geo = screen.availableGeometry()
+        self.move(geo.x() + (geo.width() - self.width()) // 2, geo.y() + geo.height() - self.height() - 130)
+
+    def _save(self):
+        old, new = self.old, self.new
+        self.hide()
+        if old and new:
+            add_dictionary_correction(old, new)
+            notify(f"Listo. La próxima vez escribo «{new}».")
+
 class App(QObject):
     def __init__(self, qapp):
         super().__init__()
@@ -2266,6 +2865,7 @@ class App(QObject):
         self.mon = None
         self.settings = None
         self.pill = Pill()
+        self.learn = LearnPopup()
         self.tray = QSystemTrayIcon(make_tray_icon("cargando"))
         self.tray.setToolTip(f"{APP} — Preparando")
         self.menu = QMenu()
@@ -2280,10 +2880,12 @@ class App(QObject):
         self.act_cfg.triggered.connect(lambda: self.open_settings(0))
         self.act_write = QAction("Escritura", self.menu)
         self.act_write.triggered.connect(lambda: self.open_settings(3))
+        self.act_words = QAction("Palabras", self.menu)
+        self.act_words.triggered.connect(lambda: self.open_settings(4))
         self.act_hist = QAction("Historial", self.menu)
-        self.act_hist.triggered.connect(lambda: self.open_settings(4))
+        self.act_hist.triggered.connect(lambda: self.open_settings(5))
         self.act_stats = QAction("Métricas", self.menu)
-        self.act_stats.triggered.connect(lambda: self.open_settings(5))
+        self.act_stats.triggered.connect(lambda: self.open_settings(6))
         self.act_log = QAction("Abrir registro de errores", self.menu)
         self.act_log.triggered.connect(self._open_log)
         self.act_quit = QAction("Salir", self.menu)
@@ -2293,6 +2895,7 @@ class App(QObject):
         self.menu.addSeparator()
         self.menu.addAction(self.act_cfg)
         self.menu.addAction(self.act_write)
+        self.menu.addAction(self.act_words)
         self.menu.addAction(self.act_hist)
         self.menu.addAction(self.act_stats)
         self.menu.addSeparator()
@@ -2304,6 +2907,7 @@ class App(QObject):
         self.tray.show()
         bridge.state_changed.connect(self._on_state)
         bridge.notice.connect(self._notice)
+        bridge.learn_offer.connect(self.learn.offer)
         bridge.update_ready.connect(self._sync_update_action)
         self._on_state("cargando" if (cfg.get("modo") == "local" or not cfg.get("groq_key")) else "listo", "")
 
@@ -2366,9 +2970,8 @@ class App(QObject):
             def mon_cb(indata, n, t, status):
                 if indata is None or indata.size == 0:
                     return
-                peak = float(np.max(np.abs(indata))) / 32768.0
                 if bridge is not None:
-                    bridge.mic_level.emit(min(1.0, peak * 4.5))
+                    bridge.mic_level.emit(chunk_level(indata))
 
             try:
                 self.mon = sd.InputStream(samplerate=FS, channels=1, dtype="int16", callback=mon_cb, device=dev, blocksize=480)
@@ -2437,22 +3040,27 @@ def _welcome():
         "Si querés, en Configuración podés pegar una clave gratis de Groq para dictar más rápido por internet.",
         "Entendido")
 
-def _whats_new(mention_pill=False):
-    pill = "Al dictar, aparece una pastilla abajo en el centro con la onda de tu voz.\n\n" if mention_pill else ""
-    cmd = pretty_hotkey(cfg.get("atajo_cmd") or "ctrl+alt+shift+space")
-    write = pretty_hotkey(cfg.get("atajo_escribir") or "ctrl+alt+a")
+def _whats_new(mention_pill=False, mention_write=False):
+    extra = ""
+    if mention_pill:
+        extra += "Al dictar, aparece una pastilla abajo en el centro con la onda de tu voz.\n\n"
+    if mention_write:
+        cmd = pretty_hotkey(cfg.get("atajo_cmd") or "ctrl+alt+shift+space")
+        write = pretty_hotkey(cfg.get("atajo_escribir") or "ctrl+alt+a")
+        extra += (
+            "El tono sigue al programa. "
+            f"Comando ({cmd}) transforma un texto seleccionado, y Ayudame a escribir ({write}) arma un mensaje.\n\n")
     if _dialog(
         APP,
-        pill + "Ahora el texto se acomoda solo.\n\n"
-        "Si te corregís («martes… no, mejor jueves a las 4»), queda la versión final. "
-        "Si pedís una lista o un párrafo, lo arma.\n\n"
-        "El tono sigue al programa: formal en el correo y en Word, chat en WhatsApp o Slack, técnico en el código. "
-        "Lo cambiás en Escritura.\n\n"
-        f"Comando: seleccioná un texto, mantené {cmd} y decí qué hacer.\n\n"
-        f"Ayudame a escribir: {write} y dictá la idea del mensaje.",
-        "Abrir Escritura"):
+        extra + "Ahora podés enseñarle palabras.\n\n"
+        "En Palabras anotás nombres, siglas y jerga. El dictado trata de escribirlas así.\n\n"
+        "Si corregís una palabra justo después de pegar, y se puede ver el cambio, te ofrece guardarla.\n\n"
+        "Un fragmento cambia una frase corta por un texto largo.\n\n"
+        "Modo susurro, en Micrófono, sube la voz baja. "
+        "Privacidad, en General, deja el audio y el texto en esta computadora.",
+        "Abrir Palabras"):
         if controller is not None:
-            controller.open_settings(3)
+            controller.open_settings(4)
 
 def main():
     global bridge
@@ -2477,7 +3085,7 @@ def main():
     App(app)
     register_hotkey()
     threading.Thread(target=update_loop, daemon=True).start()
-    if cfg.get("modo") == "local" or not cfg.get("groq_key"):
+    if cfg.get("privacidad") or cfg.get("modo") == "local" or not cfg.get("groq_key"):
         threading.Thread(target=_preload, daemon=True).start()
     else:
         set_state("listo", "")
@@ -2488,9 +3096,10 @@ def main():
     else:
         mention_pill = bool(cfg.pop("_from_old", False))
         mention_write = bool(cfg.pop("_from_12", False))
-        if mention_pill or mention_write:
+        mention_words = bool(cfg.pop("_from_13", False))
+        if mention_pill or mention_write or mention_words:
             save()
-            QTimer.singleShot(500, lambda p=mention_pill: _whats_new(p))
+            QTimer.singleShot(500, lambda p=mention_pill, w=mention_write: _whats_new(p, w))
     code = app.exec()
     try:
         if controller is not None:
