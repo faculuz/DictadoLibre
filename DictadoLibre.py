@@ -1891,7 +1891,7 @@ class Pill(QWidget):
         self._drag_start_global = None
         self._drag_origin = None
         self._dragging = False
-        self.setFixedSize(104, 34)
+        self.setFixedSize(68, 24)
         self.setWindowTitle(APP)
         self.setFocusPolicy(Qt.NoFocus)
         self.setAttribute(Qt.WA_ShowWithoutActivating, True)
@@ -2080,8 +2080,8 @@ class Pill(QWidget):
         p.setBrush(bg)
         p.drawRoundedRect(outer, radius, radius)
 
-        cx, cy = outer.left() + 12, outer.center().y()
-        glow_r = (6.2 + 1.8 * abs(math.sin(self._phase * 1.4))) if self.state in ("grabando", "procesando") else 5.0
+        cx, cy = outer.left() + 10, outer.center().y()
+        glow_r = (4.0 + 1.2 * abs(math.sin(self._phase * 1.4))) if self.state in ("grabando", "procesando") else 3.5
         rg = QRadialGradient(QPointF(cx, cy), glow_r)
         rg.setColorAt(0.0, QColor(dot.red(), dot.green(), dot.blue(), 115))
         rg.setColorAt(0.55, QColor(dot.red(), dot.green(), dot.blue(), 38))
@@ -2090,16 +2090,16 @@ class Pill(QWidget):
         p.setBrush(rg)
         p.drawEllipse(QRectF(cx - glow_r, cy - glow_r, glow_r * 2, glow_r * 2))
         p.setBrush(dot)
-        p.drawEllipse(QRectF(cx - 2.6, cy - 2.6, 5.2, 5.2))
+        p.drawEllipse(QRectF(cx - 2.0, cy - 2.0, 4.0, 4.0))
         p.setBrush(QColor(255, 255, 255, 145))
-        p.drawEllipse(QRectF(cx - 1.2, cy - 1.3, 1.6, 1.6))
+        p.drawEllipse(QRectF(cx - 0.8, cy - 0.8, 1.2, 1.2))
 
         show_x = self.state in ("grabando", "procesando")
         show_retry = self._can_show_retry()
         has_btn = show_x or show_retry
         bars = self._bars()
-        left = outer.left() + 22
-        right = outer.right() - (22 if has_btn else 10)
+        left = outer.left() + 18
+        right = outer.right() - (18 if has_btn else 8)
         gap = 2.0
         bw = max(1.8, (right - left - gap * (len(bars) - 1)) / len(bars))
         max_h = outer.height() - 8
@@ -2133,7 +2133,7 @@ class Pill(QWidget):
             p.setBrush(grad)
             p.drawRoundedRect(bar_rect, bw / 2, bw / 2)
 
-        btn_rect = QRectF(outer.right() - 16.5, cy - 6.5, 13, 13)
+        btn_rect = QRectF(outer.right() - 12.5, cy - 5.5, 11, 11)
         self._cancel = btn_rect if show_x else QRectF()
         self._retry = btn_rect if show_retry else QRectF()
         if show_x:
@@ -2142,19 +2142,19 @@ class Pill(QWidget):
             p.drawEllipse(self._cancel)
             p.setPen(QPen(QColor("#ffd6de" if self._hover_x else "#c8ccd8"), 1.15, Qt.SolidLine, Qt.RoundCap))
             c = self._cancel.center()
-            p.drawLine(QPointF(c.x() - 2.1, c.y() - 2.1), QPointF(c.x() + 2.1, c.y() + 2.1))
-            p.drawLine(QPointF(c.x() + 2.1, c.y() - 2.1), QPointF(c.x() - 2.1, c.y() + 2.1))
+            p.drawLine(QPointF(c.x() - 1.8, c.y() - 1.8), QPointF(c.x() + 1.8, c.y() + 1.8))
+            p.drawLine(QPointF(c.x() + 1.8, c.y() - 1.8), QPointF(c.x() - 1.8, c.y() + 1.8))
         elif show_retry:
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(124, 106, 247, 175) if self._hover_retry else QColor(255, 255, 255, 24))
             p.drawEllipse(self._retry)
             p.setPen(QPen(QColor("#ffffff" if self._hover_retry else "#dcdff0"), 1.2, Qt.SolidLine, Qt.RoundCap))
             p.setBrush(Qt.NoBrush)
-            arc_r = self._retry.adjusted(3.2, 3.2, -3.2, -3.2)
+            arc_r = self._retry.adjusted(2.6, 2.6, -2.6, -2.6)
             p.drawArc(arc_r, 35 * 16, 275 * 16)
             c = self._retry.center()
-            p.drawLine(QPointF(c.x() + 1.5, c.y() - 3.3), QPointF(c.x() + 3.4, c.y() - 1.7))
-            p.drawLine(QPointF(c.x() + 3.4, c.y() - 1.7), QPointF(c.x() + 1.1, c.y() - 1.1))
+            p.drawLine(QPointF(c.x() + 1.2, c.y() - 2.8), QPointF(c.x() + 2.8, c.y() - 1.4))
+            p.drawLine(QPointF(c.x() + 2.8, c.y() - 1.4), QPointF(c.x() + 0.9, c.y() - 0.9))
         p.end()
 
     def mouseMoveEvent(self, e):
