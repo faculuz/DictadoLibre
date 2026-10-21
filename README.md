@@ -8,3 +8,10 @@ En Escritura se elige el tono según el programa, el atajo de comando y Ayudame 
 En Palabras están el diccionario (nombres, siglas, jerga) y los fragmentos de voz. El modo susurro, en Micrófono, sirve para hablar bajito. Privacidad, en General, deja el audio y el texto en esta computadora.
 
 Publicar versión: `git tag v1.3.0 && git push --tags` → GitHub Actions compila `DictadoLibre-Setup.exe` y la app se actualiza sola encima de la instalación anterior.
+
+## Licencia
+
+Dictado Libre se distribuye bajo la licencia [Apache-2.0](LICENSE).
+Copyright 2026 Facundo Luzardo.
+
+Al usar, modificar o distribuir este software, por favor respeta las condiciones de la licencia y conserva el archivo [NOTICE](NOTICE) para mantener los créditos del autor original.
