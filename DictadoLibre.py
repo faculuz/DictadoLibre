@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 APP = "Dictado Libre"
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 REPO = "faculuz/DictadoLibre"
 AUMID = "FacundoLuzardo.DictadoLibre"
 DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "DictadoLibre")
